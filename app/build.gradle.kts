@@ -34,5 +34,5 @@ dependencies {
     implementation("androidx.camera:camera-camera2:$camerax")
     implementation("androidx.camera:camera-lifecycle:$camerax")
 
-    implementation("com.nanohttpd:nanohttpd:2.3.1")
+    implementation("org.nanohttpd:nanohttpd:2.3.1")
 }
