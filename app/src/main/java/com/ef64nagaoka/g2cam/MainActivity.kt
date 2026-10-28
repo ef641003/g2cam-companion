@@ -104,7 +104,8 @@ class MainActivity : Activity() {
             text = "使いかた\n" +
                 "・G2 カメラを開くと、自動でこのアプリが起動してカメラを始めます（G2 カメラを終了すると自動で止まります）。\n" +
                 "・起動しないときは、このアプリを開いて「カメラを開始」を押してから G2 カメラを開いてください（この画面を出したまま押すこと。Android の制約で、裏からは開始できません）。\n" +
-                "・画面を消しても通知が出ている間は動きます。手で止めるときは「停止」\n\n" +
+                "・画面を消しても通知が出ている間は動きます。手で止めるときは「停止」\n" +
+                "・録画は G2 カメラのメニュー「動画 録画/停止」から。動画は「写真」アプリの G2Camera フォルダに保存されます（音声はマイクの許可があるときだけ）\n\n" +
                 "vivo / OriginOS など：「電池の最適化から除外」に加えて、アプリ情報の電池設定で「バックグラウンドでの高消費電力を許可」をオンにしてください。止まるときは最近のタスクでこのアプリを鍵（ロック）してください。"
             setPadding(0, dp(16), 0, 0)
             gravity = Gravity.START
@@ -137,6 +138,10 @@ class MainActivity : Activity() {
         ) {
             need.add(Manifest.permission.POST_NOTIFICATIONS)
         }
+        // 録画の音声用（断っても無音で録画できる）
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            need.add(Manifest.permission.RECORD_AUDIO)
+        }
         if (need.isNotEmpty()) requestPermissions(need.toTypedArray(), 1)
     }
 
@@ -149,13 +154,16 @@ class MainActivity : Activity() {
     private fun render() {
         val pm = getSystemService(PowerManager::class.java)
         val camera = checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        val mic = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         val battery = pm.isIgnoringBatteryOptimizations(packageName)
         val lines = ArrayList<String>()
         lines.add(if (CameraService.running) "● 動作中（http://127.0.0.1:${CameraService.PORT}）" else "○ 停止中")
         if (CameraService.running) {
             lines.add("配信したフレーム：${CameraService.framesServed}　撮影した枚数：${CameraService.photosTaken}")
+            CameraService.recordingLabel?.let { lines.add("● 録画中 $it") }
         }
         lines.add("カメラ権限：" + if (camera) "OK" else "未許可")
+        lines.add("録画の音声（マイク）：" + if (mic) "OK" else "未許可（無音で録画。許可はアプリ情報から）")
         lines.add("電池の最適化の除外：" + if (battery) "OK" else "未設定（推奨）")
         CameraService.lastError?.let { lines.add("⚠ $it") }
         status.text = lines.joinToString("\n")

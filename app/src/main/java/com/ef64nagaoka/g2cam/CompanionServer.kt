@@ -4,11 +4,42 @@ import fi.iki.elonen.NanoHTTPD
 import fi.iki.elonen.NanoHTTPD.IHTTPSession
 import fi.iki.elonen.NanoHTTPD.Method
 import fi.iki.elonen.NanoHTTPD.Response
+import android.net.Uri
+import android.util.Base64
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
+import java.io.InputStream
 
 /** プレビュー用の 1 フレーム。seq は増えていく通し番号 */
 class Frame(val seq: Long, val bytes: ByteArray)
+
+/** 録画中の状態 */
+class RecordingState(
+    val name: String,
+    /** SystemClock.elapsedRealtime() */
+    val startedAt: Long,
+    val audio: Boolean,
+    /** 録画中もメガネへの配信（ImageAnalysis）が続いているか */
+    val live: Boolean,
+    /** 録画中も静止画を撮れるか */
+    val capture: Boolean,
+) {
+    @Volatile var durationMs = 0L
+    @Volatile var bytes = 0L
+}
+
+/** 録画の結果 */
+class RecordResult(
+    val name: String,
+    val uri: Uri?,
+    val durationMs: Long,
+    val bytes: Long,
+    val audio: Boolean,
+    /** 録画開始時の最新フレーム（JPEG）。サムネイル用 */
+    val thumbnail: ByteArray?,
+    /** 保存できたが警告があるとき・保存できなかったときの説明 */
+    val error: String?,
+)
 
 /** サーバーがカメラ側に求める操作。CameraService が実装する。 */
 interface CameraController {
@@ -41,6 +72,18 @@ interface CameraController {
 
     /** G2 カメラの終了に合わせて、このサービスを止める。止めるなら true（自動停止がオフなら false） */
     fun requestStop(): Boolean
+
+    // ── 録画 ──
+    /** 録音の権限があるか（無ければ無音で録画する） */
+    val audioPermitted: Boolean
+    /** 録画中の状態。録画していなければ null */
+    val recording: RecordingState?
+    /** 録画を始める（ブロッキング。始まるまで待つ）。すでに録画中ならその状態を返す */
+    fun startRecording(audio: Boolean, quality: String, maxMs: Long): RecordingState
+    /** 録画を止めて保存する（ブロッキング）。録画していなければ null */
+    fun stopRecording(): RecordResult?
+    /** 保存した動画を名前で開く（ストリームと大きさ）。無ければ null */
+    fun openRecording(name: String): Pair<InputStream, Long>?
 }
 
 /**
@@ -119,6 +162,47 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
                 json(Response.Status.OK, JSONObject().put("ok", true).put("stopping", camera.requestStop()))
             }
 
+            "/record/start" -> {
+                if (session.method != Method.POST) return methodNotAllowed()
+                val body = readBody(session)
+                val audio = body.optBoolean("audio", true)
+                val quality = body.optString("quality", "fhd")
+                val maxMs = body.optLong("maxMs", 0L)
+                camera.startRecording(audio, quality, maxMs)
+                json(Response.Status.OK, statusJson())
+            }
+
+            "/record/stop" -> {
+                if (session.method != Method.POST) return methodNotAllowed()
+                val r = camera.stopRecording()
+                    ?: return json(Response.Status.OK, JSONObject().put("ok", true).put("recorded", false))
+                val j = JSONObject()
+                    .put("ok", true)
+                    .put("recorded", r.uri != null)
+                    .put("name", r.name)
+                    .put("durationMs", r.durationMs)
+                    .put("bytes", r.bytes)
+                    .put("audio", r.audio)
+                    .put("uri", r.uri?.toString() ?: JSONObject.NULL)
+                    .put("error", r.error ?: JSONObject.NULL)
+                r.thumbnail?.let { j.put("thumbnailBase64", Base64.encodeToString(it, Base64.NO_WRAP)) }
+                json(Response.Status.OK, j)
+            }
+
+            "/file" -> {
+                val name = session.parameters["name"]?.firstOrNull()
+                    ?: return json(Response.Status.BAD_REQUEST, JSONObject().put("ok", false).put("error", "name がありません"))
+                if (name.contains('/') || name.contains("..")) {
+                    return json(Response.Status.BAD_REQUEST, JSONObject().put("ok", false).put("error", "不正な名前"))
+                }
+                val (stream, size) = camera.openRecording(name)
+                    ?: return json(Response.Status.NOT_FOUND, JSONObject().put("ok", false).put("error", "見つかりません"))
+                val mime = if (name.endsWith(".mp4", true)) "video/mp4" else "application/octet-stream"
+                val res = NanoHTTPD.newFixedLengthResponse(Response.Status.OK, mime, stream, size)
+                res.addHeader("Content-Disposition", "attachment; filename=\"$name\"")
+                res
+            }
+
             "/facing" -> {
                 if (session.method != Method.POST) return methodNotAllowed()
                 val want = readBody(session).optString("facing", "environment")
@@ -134,13 +218,26 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
         JSONObject()
             .put("ok", true)
             .put("app", "g2cam-companion")
-            .put("version", "1.1")
+            .put("version", "1.2")
             .put("facing", camera.facing)
             .put("width", camera.frameWidth)
             .put("height", camera.frameHeight)
             .put("zoom", camera.zoom.toDouble())
             .put("zoomMin", camera.zoomMin.toDouble())
             .put("zoomMax", camera.zoomMax.toDouble())
+            .put("canRecord", true)
+            .put("audioPermitted", camera.audioPermitted)
+            .put("recording", camera.recording != null)
+            .also { j ->
+                camera.recording?.let { r ->
+                    j.put("recordName", r.name)
+                        .put("recordMs", r.durationMs)
+                        .put("recordBytes", r.bytes)
+                        .put("recordAudio", r.audio)
+                        .put("recordLive", r.live)
+                        .put("recordCapture", r.capture)
+                }
+            }
 
     /** POST の本文（text/plain の JSON）を読む。空や不正なら空のオブジェクト */
     private fun readBody(session: IHTTPSession): JSONObject {
