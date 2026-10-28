@@ -7,19 +7,40 @@ import fi.iki.elonen.NanoHTTPD.Response
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
 
+/** プレビュー用の 1 フレーム。seq は増えていく通し番号 */
+class Frame(val seq: Long, val bytes: ByteArray)
+
 /** サーバーがカメラ側に求める操作。CameraService が実装する。 */
 interface CameraController {
     val facing: String
     val frameWidth: Int
     val frameHeight: Int
 
-    /** 最新のプレビュー用 JPEG。まだ無ければ null */
-    fun latestFrame(): ByteArray?
+    /** レンズのズーム範囲と現在の倍率（1.0 = 標準レンズ。1 未満は超広角、1 超は望遠・光学ズーム） */
+    val zoomMin: Float
+    val zoomMax: Float
+    val zoom: Float
 
-    /** 撮影して DCIM に保存し、JPEG のバイト列を返す（ブロッキング）。zoom はレンズのズーム倍率 */
-    fun capture(zoom: Double): ByteArray
+    /** まだ 1 枚もフレームを受け取っていないとき false */
+    val hasFrame: Boolean
 
+    /** 番号 afterSeq より新しいフレームを返す。無ければ最大 waitMs 待って、それでも無ければ null */
+    fun nextFrame(afterSeq: Long, waitMs: Long): Frame?
+
+    /** 今のズームのまま撮影して DCIM に保存し、JPEG のバイト列を返す（ブロッキング） */
+    fun capture(): ByteArray
+
+    /** レンズ側のズームを設定する。端末が複数レンズなら倍率に応じて超広角・標準・望遠が自動で切り替わる。実際の倍率を返す */
+    fun setZoom(zoom: Double): Float
+
+    /** カメラを切り替える。切り替えが済むまで待つ */
     fun setFacing(facing: String)
+
+    /** G2 カメラ側から何か要求が来た（応答が途絶えたら自動で止める判断に使う） */
+    fun touch()
+
+    /** G2 カメラの終了に合わせて、このサービスを止める。止めるなら true（自動停止がオフなら false） */
+    fun requestStop(): Boolean
 }
 
 /**
@@ -29,6 +50,7 @@ interface CameraController {
 class CompanionServer(private val camera: CameraController, port: Int) : NanoHTTPD("127.0.0.1", port) {
 
     override fun serve(session: IHTTPSession): Response {
+        camera.touch()
         val res = try {
             route(session)
         } catch (e: Exception) {
@@ -38,6 +60,7 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
         res.addHeader("Access-Control-Allow-Origin", "*")
         res.addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         res.addHeader("Access-Control-Allow-Headers", "*")
+        res.addHeader("Access-Control-Expose-Headers", "X-Frame-Seq")
         // https のトンネル経由で開いた G2 アプリから 127.0.0.1 を呼ぶとき（Private Network Access）
         res.addHeader("Access-Control-Allow-Private-Network", "true")
         res.addHeader("Access-Control-Max-Age", "600")
@@ -50,20 +73,32 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
             return NanoHTTPD.newFixedLengthResponse(Response.Status.NO_CONTENT, "text/plain", "")
         }
         return when (session.uri) {
-            "/status" -> json(
-                Response.Status.OK,
-                JSONObject()
-                    .put("ok", true)
-                    .put("app", "g2cam-companion")
-                    .put("version", "1.0")
-                    .put("facing", camera.facing)
-                    .put("width", camera.frameWidth)
-                    .put("height", camera.frameHeight),
-            )
+            "/status" -> json(Response.Status.OK, statusJson())
 
             "/frame" -> {
-                val bytes = camera.latestFrame()
-                    ?: return json(Response.Status.SERVICE_UNAVAILABLE, JSONObject().put("ok", false).put("error", "no frame"))
+                val after = session.parameters["after"]?.firstOrNull()?.toLongOrNull() ?: 0L
+                val frame = camera.nextFrame(after, 200)
+                if (frame == null) {
+                    // まだ 1 枚も無い → 503、新しいフレームが来なかっただけ → 204（クライアントはそのまま取り直す）
+                    return if (camera.hasFrame) {
+                        NanoHTTPD.newFixedLengthResponse(Response.Status.NO_CONTENT, "text/plain", "")
+                    } else {
+                        json(Response.Status.SERVICE_UNAVAILABLE, JSONObject().put("ok", false).put("error", "no frame"))
+                    }
+                }
+                val res = NanoHTTPD.newFixedLengthResponse(
+                    Response.Status.OK,
+                    "image/jpeg",
+                    ByteArrayInputStream(frame.bytes),
+                    frame.bytes.size.toLong(),
+                )
+                res.addHeader("X-Frame-Seq", frame.seq.toString())
+                res
+            }
+
+            "/capture" -> {
+                if (session.method != Method.POST) return methodNotAllowed()
+                val bytes = camera.capture()
                 NanoHTTPD.newFixedLengthResponse(
                     Response.Status.OK,
                     "image/jpeg",
@@ -72,28 +107,40 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
                 )
             }
 
-            "/capture" -> {
+            "/zoom" -> {
                 if (session.method != Method.POST) return methodNotAllowed()
-                val zoom = readBody(session).optDouble("zoom", 1.0)
-                val bytes = camera.capture(if (zoom.isNaN()) 1.0 else zoom)
-                NanoHTTPD.newFixedLengthResponse(
-                    Response.Status.OK,
-                    "image/jpeg",
-                    ByteArrayInputStream(bytes),
-                    bytes.size.toLong(),
-                )
+                val want = readBody(session).optDouble("zoom", 1.0)
+                camera.setZoom(if (want.isNaN()) 1.0 else want)
+                json(Response.Status.OK, statusJson())
+            }
+
+            "/stop" -> {
+                if (session.method != Method.POST) return methodNotAllowed()
+                json(Response.Status.OK, JSONObject().put("ok", true).put("stopping", camera.requestStop()))
             }
 
             "/facing" -> {
                 if (session.method != Method.POST) return methodNotAllowed()
                 val want = readBody(session).optString("facing", "environment")
                 camera.setFacing(want)
-                json(Response.Status.OK, JSONObject().put("ok", true).put("facing", camera.facing))
+                json(Response.Status.OK, statusJson())
             }
 
             else -> json(Response.Status.NOT_FOUND, JSONObject().put("ok", false).put("error", "not found"))
         }
     }
+
+    private fun statusJson(): JSONObject =
+        JSONObject()
+            .put("ok", true)
+            .put("app", "g2cam-companion")
+            .put("version", "1.1")
+            .put("facing", camera.facing)
+            .put("width", camera.frameWidth)
+            .put("height", camera.frameHeight)
+            .put("zoom", camera.zoom.toDouble())
+            .put("zoomMin", camera.zoomMin.toDouble())
+            .put("zoomMax", camera.zoomMax.toDouble())
 
     /** POST の本文（text/plain の JSON）を読む。空や不正なら空のオブジェクト */
     private fun readBody(session: IHTTPSession): JSONObject {

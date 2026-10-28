@@ -25,6 +25,21 @@
             </intent-filter>
         </activity>
 
+        <!-- g2cam://start …… G2 カメラアプリからの自動起動用。画面は出さずにサービスを始めて閉じる -->
+        <activity
+            android:name=".LaunchActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="g2cam" android:host="start" />
+            </intent-filter>
+        </activity>
+
         <service
             android:name=".CameraService"
             android:exported="false"

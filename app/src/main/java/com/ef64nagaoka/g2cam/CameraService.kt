@@ -37,6 +37,8 @@ import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import kotlin.math.max
 
 /**
@@ -49,6 +51,8 @@ class CameraService : LifecycleService(), CameraController {
     companion object {
         const val PORT = 8787
         const val ACTION_STOP = "com.ef64nagaoka.g2cam.STOP"
+        /** G2 カメラからの要求が途絶えてから自動で止めるまで（ミリ秒） */
+        private const val IDLE_STOP_MS = 120_000L
         private const val CHANNEL_ID = "g2cam"
         private const val NOTIFICATION_ID = 1
         private const val TAG = "G2Cam"
@@ -67,6 +71,11 @@ class CameraService : LifecycleService(), CameraController {
     override val frameWidth: Int get() = frameW
     override val frameHeight: Int get() = frameH
 
+    @Volatile private var zoomNow = 1f
+    override val zoom: Float get() = zoomNow
+    override val zoomMin: Float get() = camera?.cameraInfo?.zoomState?.value?.minZoomRatio ?: 1f
+    override val zoomMax: Float get() = camera?.cameraInfo?.zoomState?.value?.maxZoomRatio ?: 1f
+
     private val mainHandler = Handler(Looper.getMainLooper())
     private val analysisExecutor = Executors.newSingleThreadExecutor()
     private val ioExecutor = Executors.newSingleThreadExecutor()
@@ -79,8 +88,28 @@ class CameraService : LifecycleService(), CameraController {
     private var wakeLock: PowerManager.WakeLock? = null
     private var orientationListener: OrientationEventListener? = null
 
-    @Volatile private var latestJpeg: ByteArray? = null
+    // 最新フレーム。seq は増えていく通し番号（サービスを再起動しても戻らないよう、時刻から始める）
+    private val frameLock = ReentrantLock()
+    private val frameArrived = frameLock.newCondition()
+    @Volatile private var latestFrame: Frame? = null
+    private var frameSeq = System.currentTimeMillis()
+    override val hasFrame: Boolean get() = latestFrame != null
     private var lastFrameAt = 0L
+
+    // G2 カメラ側とのつながり（終了に合わせた自動停止）
+    @Volatile private var lastClientAt = 0L
+    @Volatile private var clientSeen = false
+    private val idleWatchdog = object : Runnable {
+        override fun run() {
+            val idle = SystemClock.elapsedRealtime() - lastClientAt
+            if (clientSeen && idle > IDLE_STOP_MS && Prefs.autoStop(this@CameraService)) {
+                Log.i(TAG, "G2 カメラからの応答が ${idle / 1000} 秒途絶えたので停止します")
+                stopSelf()
+                return
+            }
+            mainHandler.postDelayed(this, 5000)
+        }
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
@@ -100,14 +129,17 @@ class CameraService : LifecycleService(), CameraController {
             acquireWakeLock()
             startServer()
             startOrientationListener()
+            bindCamera(null)
+            clientSeen = false
+            mainHandler.postDelayed(idleWatchdog, 5000)
         }
-        bindCamera()
         // システムが勝手に再起動すると背景からのカメラ開始になり失敗するので、再起動はしない
         return START_NOT_STICKY
     }
 
     override fun onDestroy() {
         running = false
+        mainHandler.removeCallbacks(idleWatchdog)
         orientationListener?.disable()
         server?.stop()
         server = null
@@ -189,7 +221,7 @@ class CameraService : LifecycleService(), CameraController {
     }
 
     // ── カメラ ──
-    private fun bindCamera() {
+    private fun bindCamera(onDone: Runnable?) {
         val future = ProcessCameraProvider.getInstance(this)
         future.addListener({
             try {
@@ -218,10 +250,13 @@ class CameraService : LifecycleService(), CameraController {
                 camera = provider.bindToLifecycle(this, selector, analysis, capture)
                 imageAnalysis = analysis
                 imageCapture = capture
+                zoomNow = 1f
                 lastError = null
             } catch (e: Exception) {
                 lastError = "カメラを開始できません: ${e.message}"
                 Log.e(TAG, "bindCamera failed", e)
+            } finally {
+                onDone?.run()
             }
         }, ContextCompat.getMainExecutor(this))
     }
@@ -230,7 +265,7 @@ class CameraService : LifecycleService(), CameraController {
     private fun handleFrame(image: ImageProxy) {
         try {
             val now = SystemClock.elapsedRealtime()
-            if (now - lastFrameAt < 70) return // 送信側が速くても 14fps あれば十分
+            if (now - lastFrameAt < 30) return // 30fps まで通す（カメラ側が 30fps なので実質すべて）
             lastFrameAt = now
 
             val src = image.toBitmap()
@@ -243,7 +278,12 @@ class CameraService : LifecycleService(), CameraController {
             out.compress(Bitmap.CompressFormat.JPEG, 70, stream)
             frameW = out.width
             frameH = out.height
-            latestJpeg = stream.toByteArray()
+            val bytes = stream.toByteArray()
+            frameLock.withLock {
+                frameSeq += 1
+                latestFrame = Frame(frameSeq, bytes)
+                frameArrived.signalAll()
+            }
             if (out !== src) out.recycle()
             src.recycle()
         } catch (e: Exception) {
@@ -253,72 +293,87 @@ class CameraService : LifecycleService(), CameraController {
         }
     }
 
-    override fun latestFrame(): ByteArray? {
-        framesServed++
-        return latestJpeg
+    override fun nextFrame(afterSeq: Long, waitMs: Long): Frame? {
+        var remainNs = TimeUnit.MILLISECONDS.toNanos(waitMs)
+        frameLock.withLock {
+            while (true) {
+                val f = latestFrame
+                if (f != null && f.seq > afterSeq) {
+                    framesServed++
+                    return f
+                }
+                if (remainNs <= 0L) return null
+                remainNs = frameArrived.awaitNanos(remainNs)
+            }
+        }
+    }
+
+    override fun touch() {
+        lastClientAt = SystemClock.elapsedRealtime()
+        clientSeen = true
+    }
+
+    override fun requestStop(): Boolean {
+        if (!Prefs.autoStop(this)) return false
+        // 返事を返し終えてから止める
+        mainHandler.postDelayed({ stopSelf() }, 300)
+        return true
+    }
+
+    override fun setZoom(zoom: Double): Float {
+        val cam = camera ?: return 1f
+        val state = cam.cameraInfo.zoomState.value
+        val target = if (state != null) zoom.toFloat().coerceIn(state.minZoomRatio, state.maxZoomRatio) else 1f
+        // 結果は待たない（ズーム中も映像は流れ続ける）。1 未満なら端末が超広角に、大きければ望遠に切り替える
+        cam.cameraControl.setZoomRatio(target)
+        zoomNow = target
+        return target
     }
 
     override fun setFacing(facing: String) {
         val next = if (facing == "user") "user" else "environment"
         if (next == facingValue) return
         facingValue = next
-        latestJpeg = null
-        mainHandler.post { bindCamera() }
+        frameLock.withLock { latestFrame = null }
+        // 切り替えが済んでから返す（直後にズーム範囲を読むため）
+        val latch = CountDownLatch(1)
+        mainHandler.post { bindCamera(Runnable { latch.countDown() }) }
+        latch.await(3, TimeUnit.SECONDS)
     }
 
-    override fun capture(zoom: Double): ByteArray = synchronized(captureLock) {
-        val cam = camera ?: throw IllegalStateException("カメラが起動していません")
+    override fun capture(): ByteArray = synchronized(captureLock) {
         val cap = imageCapture ?: throw IllegalStateException("カメラが起動していません")
 
-        // ズームはレンズ側で掛ける（画質が良い）。撮影後に戻す
-        val state = cam.cameraInfo.zoomState.value
-        val minZ = state?.minZoomRatio ?: 1f
-        val target = if (state != null) zoom.toFloat().coerceIn(state.minZoomRatio, state.maxZoomRatio) else 1f
-        val zoomed = target > minZ + 0.01f
-        if (zoomed) {
-            cam.cameraControl.setZoomRatio(target).get(2, TimeUnit.SECONDS)
-            Thread.sleep(250)
+        val name = "G2_" + SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, name)
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/G2Camera")
         }
-        try {
-            val name = "G2_" + SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
-            val values = ContentValues().apply {
-                put(MediaStore.Images.Media.DISPLAY_NAME, name)
-                put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/G2Camera")
-            }
-            val options = ImageCapture.OutputFileOptions
-                .Builder(contentResolver, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-                .build()
+        val options = ImageCapture.OutputFileOptions
+            .Builder(contentResolver, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            .build()
 
-            val latch = CountDownLatch(1)
-            var savedUri: Uri? = null
-            var failure: Throwable? = null
-            cap.takePicture(options, ioExecutor, object : ImageCapture.OnImageSavedCallback {
-                override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-                    savedUri = output.savedUri
-                    latch.countDown()
-                }
-
-                override fun onError(exception: ImageCaptureException) {
-                    failure = exception
-                    latch.countDown()
-                }
-            })
-            if (!latch.await(10, TimeUnit.SECONDS)) throw IllegalStateException("撮影がタイムアウトしました")
-            failure?.let { throw it }
-            val uri = savedUri ?: throw IllegalStateException("保存先が取得できません")
-            val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                ?: throw IllegalStateException("保存した写真を読めません")
-            photosTaken++
-            bytes
-        } finally {
-            if (zoomed) {
-                try {
-                    cam.cameraControl.setZoomRatio(minZ)
-                } catch (e: Exception) {
-                    Log.w(TAG, "zoom reset failed", e)
-                }
+        val latch = CountDownLatch(1)
+        var savedUri: Uri? = null
+        var failure: Throwable? = null
+        cap.takePicture(options, ioExecutor, object : ImageCapture.OnImageSavedCallback {
+            override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                savedUri = output.savedUri
+                latch.countDown()
             }
-        }
+
+            override fun onError(exception: ImageCaptureException) {
+                failure = exception
+                latch.countDown()
+            }
+        })
+        if (!latch.await(10, TimeUnit.SECONDS)) throw IllegalStateException("撮影がタイムアウトしました")
+        failure?.let { throw it }
+        val uri = savedUri ?: throw IllegalStateException("保存先が取得できません")
+        val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+            ?: throw IllegalStateException("保存した写真を読めません")
+        photosTaken++
+        bytes
     }
 }

@@ -16,6 +16,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -93,11 +94,17 @@ class MainActivity : Activity() {
             }
         })
 
+        root.addView(CheckBox(this).apply {
+            text = "G2 カメラが終了したら自動で停止する（終了の合図、または 2 分間応答がないとき）"
+            isChecked = Prefs.autoStop(this@MainActivity)
+            setOnCheckedChangeListener { _, checked -> Prefs.setAutoStop(this@MainActivity, checked) }
+        })
+
         root.addView(TextView(this).apply {
             text = "使いかた\n" +
-                "1. 「カメラを開始」を押す（この画面を出したまま押すこと。Android の制約で、裏からは開始できません）\n" +
-                "2. Even アプリに切り替えて G2 カメラを開く。自動でこのアプリを見つけて映像を受け取ります\n" +
-                "3. 画面を消しても通知が出ている間は動きます。止めるときは「停止」\n\n" +
+                "・G2 カメラを開くと、自動でこのアプリが起動してカメラを始めます（G2 カメラを終了すると自動で止まります）。\n" +
+                "・起動しないときは、このアプリを開いて「カメラを開始」を押してから G2 カメラを開いてください（この画面を出したまま押すこと。Android の制約で、裏からは開始できません）。\n" +
+                "・画面を消しても通知が出ている間は動きます。手で止めるときは「停止」\n\n" +
                 "vivo / OriginOS など：「電池の最適化から除外」に加えて、アプリ情報の電池設定で「バックグラウンドでの高消費電力を許可」をオンにしてください。止まるときは最近のタスクでこのアプリを鍵（ロック）してください。"
             setPadding(0, dp(16), 0, 0)
             gravity = Gravity.START
