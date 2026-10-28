@@ -131,6 +131,8 @@ class CameraService : LifecycleService(), CameraController {
     private var recordLimitTimer: Runnable? = null
     /** このサービスで録画したファイル（名前 → URI）。/file で返すときに使う */
     private val recentFiles = HashMap<String, Uri>()
+    /** G2 カメラ側がまだ受け取っていない録画結果（最長時間や通知で止めたとき） */
+    @Volatile private var pendingResult: RecordResult? = null
 
     // G2 カメラ側とのつながり（終了に合わせた自動停止）
     @Volatile private var lastClientAt = 0L
@@ -155,13 +157,7 @@ class CameraService : LifecycleService(), CameraController {
                 return START_NOT_STICKY
             }
             ACTION_STOP_RECORDING -> {
-                ioExecutor.execute {
-                    try {
-                        stopRecording()
-                    } catch (e: Exception) {
-                        Log.w(TAG, "stop recording from notification failed", e)
-                    }
-                }
+                ioExecutor.execute { stopRecordingInternally("通知") }
                 return START_NOT_STICKY
             }
         }
@@ -207,9 +203,7 @@ class CameraService : LifecycleService(), CameraController {
         }
         ioExecutor.execute {
             try {
-                stopRecording()
-            } catch (e: Exception) {
-                Log.w(TAG, "stop recording on shutdown failed", e)
+                stopRecordingInternally("サービス停止")
             } finally {
                 mainHandler.post { stopSelf() }
             }
@@ -613,21 +607,29 @@ class CameraService : LifecycleService(), CameraController {
         recordingLabel = "0:00"
         updateNotification("録画中（${if (withAudio) "音声あり" else "無音"}）")
         if (maxMs > 0) {
-            val timer = Runnable {
-                ioExecutor.execute {
-                    try {
-                        Log.i(TAG, "最長録画時間に達したので止めます")
-                        stopRecording()
-                    } catch (e: Exception) {
-                        Log.w(TAG, "auto stop failed", e)
-                    }
-                }
-            }
+            val timer = Runnable { ioExecutor.execute { stopRecordingInternally("最長録画時間") } }
             recordLimitTimer = timer
             mainHandler.postDelayed(timer, maxMs)
         }
         Log.i(TAG, "録画開始 $name（音声 $withAudio・配信 ${state.live}・撮影 ${state.capture}）")
         return state
+    }
+
+    override fun takePendingResult(): RecordResult? = synchronized(recordLock) {
+        val r = pendingResult
+        pendingResult = null
+        r
+    }
+
+    /** 自分の都合で止めたときは、結果を G2 カメラ側が取りに来るまで持っておく */
+    private fun stopRecordingInternally(reason: String) {
+        try {
+            Log.i(TAG, "録画を止めます（$reason）")
+            val r = stopRecording()
+            if (r != null) pendingResult = r
+        } catch (e: Exception) {
+            Log.w(TAG, "stop recording ($reason) failed", e)
+        }
     }
 
     override fun stopRecording(): RecordResult? = synchronized(recordLock) {

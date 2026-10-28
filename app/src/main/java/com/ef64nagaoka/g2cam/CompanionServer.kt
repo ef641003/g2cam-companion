@@ -82,6 +82,8 @@ interface CameraController {
     fun startRecording(audio: Boolean, quality: String, maxMs: Long): RecordingState
     /** 録画を止めて保存する（ブロッキング）。録画していなければ null */
     fun stopRecording(): RecordResult?
+    /** 向こう側の都合（最長時間・通知）で止まった録画の結果。一度返したら消える */
+    fun takePendingResult(): RecordResult?
     /** 保存した動画を名前で開く（ストリームと大きさ）。無ければ null */
     fun openRecording(name: String): Pair<InputStream, Long>?
 }
@@ -174,7 +176,7 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
 
             "/record/stop" -> {
                 if (session.method != Method.POST) return methodNotAllowed()
-                val r = camera.stopRecording()
+                val r = camera.stopRecording() ?: camera.takePendingResult()
                     ?: return json(Response.Status.OK, JSONObject().put("ok", true).put("recorded", false))
                 val j = JSONObject()
                     .put("ok", true)
