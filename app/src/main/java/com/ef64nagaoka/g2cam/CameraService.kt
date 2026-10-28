@@ -352,6 +352,20 @@ class CameraService : LifecycleService(), CameraController {
         false
     }
 
+    /** 動画の電子式手ブレ補正（EIS）が使える端末か */
+    private fun eisSupported(): Boolean = try {
+        val cm = getSystemService(CameraManager::class.java)
+        val want = if (facingValue == "user") CameraCharacteristics.LENS_FACING_FRONT else CameraCharacteristics.LENS_FACING_BACK
+        cm.cameraIdList.any { id ->
+            val c = cm.getCameraCharacteristics(id)
+            c.get(CameraCharacteristics.LENS_FACING) == want &&
+                c.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
+                    ?.contains(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON) == true
+        }
+    } catch (e: Exception) {
+        false
+    }
+
     /** 静止画のユースケース。高画質モードなら最高画質・最大解像度・ノイズ低減と輪郭を高品質に */
     @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
     private fun buildCapture(recording: Boolean, withInterop: Boolean): ImageCapture {
@@ -470,8 +484,19 @@ class CameraService : LifecycleService(), CameraController {
             val analysis = analysisBuilder.build()
             analysis.setAnalyzer(analysisExecutor) { image -> handleFrame(image) }
 
+            var eisOn = false
             val video = if (recorder != null) {
-                VideoCapture.Builder(recorder).setTargetRotation(rotation).setVideoStabilizationEnabled(stabilize).build()
+                val vb = VideoCapture.Builder(recorder).setTargetRotation(rotation)
+                if (stabilize && eisSupported()) {
+                    try {
+                        Camera2Interop.Extender(vb)
+                            .setCaptureRequestOption(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)
+                        eisOn = true
+                    } catch (e: Exception) {
+                        Log.w(TAG, "eis failed", e)
+                    }
+                }
+                vb.build()
             } else {
                 null
             }
@@ -517,7 +542,7 @@ class CameraService : LifecycleService(), CameraController {
             camera = bound
             boundLabel = used.label
             val withVideo = video != null && used.cases.contains(video)
-            stabLabel = "光学" + (if (ois) "あり" else "なし") + "・動画の電子式" + (if (!withVideo) "（録画していない）" else if (stabilize) "オン" else "オフ")
+            stabLabel = "光学" + (if (ois) "あり" else "なし") + "・動画の電子式" + (if (!withVideo) "（録画していない）" else if (eisOn) "オン" else "オフ")
             extensionLabel = used.extension
             imageAnalysis = used.cases.filterIsInstance<ImageAnalysis>().firstOrNull()
             imageCapture = used.cases.filterIsInstance<ImageCapture>().firstOrNull()
