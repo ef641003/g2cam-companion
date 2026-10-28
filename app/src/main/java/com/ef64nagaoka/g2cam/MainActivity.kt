@@ -25,8 +25,13 @@ import androidx.core.content.ContextCompat
 /** サービスの開始／停止と、電池の最適化除外などの案内だけを置いた画面。 */
 class MainActivity : Activity() {
 
+    companion object {
+        private const val REQ_TREE = 11
+    }
+
     private lateinit var status: TextView
     private lateinit var toggle: Button
+    private lateinit var saveDir: TextView
     private val handler = Handler(Looper.getMainLooper())
     private val refresh = object : Runnable {
         override fun run() {
@@ -39,6 +44,24 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         buildUi()
         requestRuntimePermissions()
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQ_TREE || resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        try {
+            contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+            )
+            Prefs.setSaveTree(this, uri.toString())
+        } catch (e: Exception) {
+            Prefs.setSaveTree(this, null)
+            status.text = "このフォルダは使えません：${e.message}\n別のフォルダ（サブフォルダ）を選んでください"
+        }
+        render()
     }
 
     override fun onResume() {
@@ -83,6 +106,43 @@ class MainActivity : Activity() {
             topMargin = dp(12)
         })
 
+        saveDir = TextView(this).apply {
+            setPadding(0, dp(12), 0, dp(4))
+        }
+        root.addView(saveDir)
+        root.addView(Button(this).apply {
+            text = "保存先フォルダを選ぶ"
+            setOnClickListener {
+                // 内部ストレージやSDカードの好きなフォルダ。ルートや Download 直下は Android が選ばせないので、サブフォルダを作って選ぶ
+                startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).addFlags(
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                        Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                        Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+                        Intent.FLAG_GRANT_PREFIX_URI_PERMISSION,
+                ), REQ_TREE)
+            }
+        })
+        root.addView(Button(this).apply {
+            text = "保存先を既定（写真アプリ）に戻す"
+            setOnClickListener {
+                Prefs.saveTree(this@MainActivity)?.let {
+                    try {
+                        contentResolver.releasePersistableUriPermission(
+                            Uri.parse(it),
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+                        )
+                    } catch (_: Exception) {
+                    }
+                }
+                Prefs.setSaveTree(this@MainActivity, null)
+                render()
+            }
+        })
+        root.addView(CheckBox(this).apply {
+            text = "静止画を高画質で撮る（端末のHDR・オート機能を使う。非対応の端末では通常撮影）。反映は次にカメラを開始したとき"
+            isChecked = Prefs.highQuality(this@MainActivity)
+            setOnCheckedChangeListener { _, checked -> Prefs.setHighQuality(this@MainActivity, checked) }
+        })
         root.addView(Button(this).apply {
             text = "電池の最適化から除外する"
             setOnClickListener { requestIgnoreBatteryOptimizations() }
@@ -105,7 +165,7 @@ class MainActivity : Activity() {
                 "・G2 カメラを開くと、自動でこのアプリが起動してカメラを始めます（G2 カメラを終了すると自動で止まります）。\n" +
                 "・起動しないときは、このアプリを開いて「カメラを開始」を押してから G2 カメラを開いてください（この画面を出したまま押すこと。Android の制約で、裏からは開始できません）。\n" +
                 "・画面を消しても通知が出ている間は動きます。手で止めるときは「停止」\n" +
-                "・録画は G2 カメラのメニュー「動画 録画/停止」から。動画は「写真」アプリの G2Camera フォルダに保存されます（音声はマイクの許可があるときだけ）\n\n" +
+                "・録画は G2 カメラのメニュー「動画 録画/停止」から。写真も動画も、上で選んだ保存先にすぐ保存されます（選ばなければ「写真」アプリの G2Camera フォルダ。音声はマイクの許可があるときだけ）\n\n" +
                 "vivo / OriginOS など：「電池の最適化から除外」に加えて、アプリ情報の電池設定で「バックグラウンドでの高消費電力を許可」をオンにしてください。止まるときは最近のタスクでこのアプリを鍵（ロック）してください。"
             setPadding(0, dp(16), 0, 0)
             gravity = Gravity.START
@@ -166,6 +226,8 @@ class MainActivity : Activity() {
         lines.add("録画の音声（マイク）：" + if (mic) "OK" else "未許可（無音で録画。許可はアプリ情報から）")
         lines.add("電池の最適化の除外：" + if (battery) "OK" else "未設定（推奨）")
         CameraService.lastError?.let { lines.add("⚠ $it") }
+        CameraService.diagText?.let { lines.add("構成：$it") }
+        saveDir.text = "保存先：" + Storage.describe(this)
         status.text = lines.joinToString("\n")
         toggle.text = if (CameraService.running) "停止" else "カメラを開始"
     }

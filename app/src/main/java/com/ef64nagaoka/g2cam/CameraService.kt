@@ -12,6 +12,7 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.hardware.camera2.CaptureRequest
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
@@ -22,6 +23,8 @@ import android.util.Log
 import android.util.Size
 import android.view.OrientationEventListener
 import android.view.Surface
+import androidx.camera.camera2.interop.Camera2Interop
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
@@ -29,10 +32,14 @@ import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.UseCase
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
+import androidx.camera.extensions.ExtensionMode
+import androidx.camera.extensions.ExtensionsManager
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FallbackStrategy
+import androidx.camera.video.FileDescriptorOutputOptions
 import androidx.camera.video.MediaStoreOutputOptions
 import androidx.camera.video.Quality
 import androidx.camera.video.QualitySelector
@@ -70,7 +77,7 @@ class CameraService : LifecycleService(), CameraController {
         private const val CHANNEL_ID = "g2cam"
         private const val NOTIFICATION_ID = 1
         private const val TAG = "G2Cam"
-        private const val RELATIVE_DIR = "DCIM/G2Camera"
+        private const val RELATIVE_DIR = Storage.RELATIVE_DIR
 
         @Volatile var running = false
         @Volatile var lastError: String? = null
@@ -78,6 +85,8 @@ class CameraService : LifecycleService(), CameraController {
         @Volatile var photosTaken = 0
         /** 画面表示用：録画中なら「0:12」のような経過時間、録画していなければ null */
         @Volatile var recordingLabel: String? = null
+        /** 画面表示用：カメラ構成などの診断 */
+        @Volatile var diagText: String? = null
     }
 
     // ── CameraController ──
@@ -101,6 +110,8 @@ class CameraService : LifecycleService(), CameraController {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val analysisExecutor = Executors.newSingleThreadExecutor()
     private val ioExecutor = Executors.newSingleThreadExecutor()
+    /** Recorder 専用。ioExecutor と共用すると、停止待ちで ioExecutor が塞がったときに保存処理が進まなくなる */
+    private val recorderExecutor = Executors.newSingleThreadExecutor()
     private val captureLock = Any()
     private val recordLock = Any()
 
@@ -129,6 +140,18 @@ class CameraService : LifecycleService(), CameraController {
     private var finalizeLatch: CountDownLatch? = null
     @Volatile private var finalizeEvent: VideoRecordEvent.Finalize? = null
     private var recordLimitTimer: Runnable? = null
+    /** 選んだフォルダに録画しているときの保存先（MediaStore の場合は null） */
+    private var customVideoUri: Uri? = null
+
+    // 診断（/status の diag と本体画面に出す）
+    @Volatile private var boundLabel = "未起動"
+    @Volatile private var extensionLabel = "なし"
+    @Volatile private var bindNotes = ""
+    override val diag: String
+        get() = buildDiag()
+
+    private fun buildDiag(): String = "構成=$boundLabel・静止画の拡張=$extensionLabel・保存先=${Storage.describe(this)}" +
+            (if (bindNotes.isNotEmpty()) "・束ね直しの失敗=$bindNotes" else "")
     /** このサービスで録画したファイル（名前 → URI）。/file で返すときに使う */
     private val recentFiles = HashMap<String, Uri>()
     /** G2 カメラ側がまだ受け取っていない録画結果（最長時間や通知で止めたとき） */
@@ -184,6 +207,7 @@ class CameraService : LifecycleService(), CameraController {
     override fun onDestroy() {
         running = false
         recordingLabel = null
+        diagText = null
         mainHandler.removeCallbacks(idleWatchdog)
         recordLimitTimer?.let { mainHandler.removeCallbacks(it) }
         orientationListener?.disable()
@@ -193,6 +217,7 @@ class CameraService : LifecycleService(), CameraController {
         super.onDestroy() // カメラの unbind を先に済ませてから実行系を止める
         analysisExecutor.shutdownNow()
         ioExecutor.shutdownNow()
+        recorderExecutor.shutdownNow()
     }
 
     /** 録画中なら保存してから止める。G2 カメラの終了・通知の「停止」・応答の途絶えから呼ばれる */
@@ -307,93 +332,176 @@ class CameraService : LifecycleService(), CameraController {
     }
 
     // ── カメラ ──
+    /** 束ね方の候補ひとつ */
+    private class Attempt(val selector: CameraSelector, val cases: List<UseCase>, val label: String, val extension: String)
+
+    /** 静止画のユースケース。高画質モードなら最高画質・最大解像度・ノイズ低減と輪郭を高品質に */
+    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
+    private fun buildCapture(recording: Boolean, withInterop: Boolean): ImageCapture {
+        val hq = Prefs.highQuality(this) && !recording
+        val b = ImageCapture.Builder()
+            .setCaptureMode(if (hq) ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY else ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+            .setJpegQuality(if (hq) 100 else 95)
+            .setTargetRotation(rotation)
+        if (hq) {
+            b.setResolutionSelector(
+                ResolutionSelector.Builder()
+                    .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                    .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
+                    .build(),
+            )
+            if (withInterop) {
+                try {
+                    val x = Camera2Interop.Extender(b)
+                    x.setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
+                    x.setCaptureRequestOption(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_HIGH_QUALITY)
+                    x.setCaptureRequestOption(
+                        CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE,
+                        CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE_HIGH_QUALITY,
+                    )
+                } catch (e: Exception) {
+                    Log.w(TAG, "camera2 interop failed", e)
+                }
+            }
+        }
+        return b.build()
+    }
+
+    /** 端末のカメラ拡張（オート → HDR）が使えるなら、拡張つきのセレクターを返す */
+    private fun extensionSelector(ext: ExtensionsManager?, base: CameraSelector): Pair<CameraSelector, String>? {
+        if (ext == null) return null
+        for ((mode, label) in listOf(ExtensionMode.AUTO to "オート", ExtensionMode.HDR to "HDR")) {
+            try {
+                if (ext.isExtensionAvailable(base, mode)) {
+                    return ext.getExtensionEnabledCameraSelector(base, mode) to label
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "extension check failed: $label", e)
+            }
+        }
+        return null
+    }
+
     /**
      * ユースケースを束ねる。recorder が null なら「配信＋撮影」、あれば「配信＋録画＋撮影」。
      * 端末が同時に使えない組み合わせのときは、撮影 → 配信の順に外して試す。
+     * 高画質モードでは、先に端末のカメラ拡張つき（HDR 等）で試し、だめなら通常に戻す。
      */
     private fun bindCamera(recorder: Recorder?, onDone: Runnable?) {
         val future = ProcessCameraProvider.getInstance(this)
         future.addListener({
             try {
                 val provider = future.get()
-                provider.unbindAll()
-                imageAnalysis = null
-                imageCapture = null
-                videoCapture = null
-
-                val analysis = ImageAnalysis.Builder()
-                    .setResolutionSelector(
-                        ResolutionSelector.Builder()
-                            .setResolutionStrategy(
-                                ResolutionStrategy(Size(640, 480), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER),
-                            )
-                            .build(),
-                    )
-                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                    .setTargetRotation(rotation)
-                    .build()
-                analysis.setAnalyzer(analysisExecutor) { image -> handleFrame(image) }
-
-                val capture = ImageCapture.Builder()
-                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-                    .setJpegQuality(95)
-                    .setTargetRotation(rotation)
-                    .build()
-
-                val video = if (recorder != null) {
-                    VideoCapture.Builder(recorder).setTargetRotation(rotation).build()
+                if (recorder == null && Prefs.highQuality(this)) {
+                    val extFuture = ExtensionsManager.getInstanceAsync(this, provider)
+                    extFuture.addListener({
+                        val ext = try {
+                            extFuture.get()
+                        } catch (e: Exception) {
+                            Log.w(TAG, "extensions unavailable", e)
+                            null
+                        }
+                        finishBind(provider, ext, recorder, onDone)
+                    }, ContextCompat.getMainExecutor(this))
                 } else {
-                    null
-                }
-
-                val selector = if (facingValue == "user") CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
-                val attempts: List<List<UseCase>> = if (video != null) {
-                    listOf(
-                        listOf(analysis, video, capture),
-                        listOf(analysis, video),
-                        listOf(video, capture),
-                        listOf(video),
-                    )
-                } else {
-                    listOf(listOf(analysis, capture), listOf(analysis))
-                }
-                var bound: Camera? = null
-                var used: List<UseCase> = emptyList()
-                var lastFailure: Exception? = null
-                for (set in attempts) {
-                    try {
-                        bound = provider.bindToLifecycle(this, selector, *set.toTypedArray())
-                        used = set
-                        break
-                    } catch (e: Exception) {
-                        lastFailure = e
-                        Log.w(TAG, "bind failed for ${set.size} use cases: ${e.message}")
-                        provider.unbindAll()
-                    }
-                }
-                if (bound == null) throw lastFailure ?: IllegalStateException("bind failed")
-                camera = bound
-                imageAnalysis = if (used.contains(analysis)) analysis else null
-                imageCapture = if (used.contains(capture)) capture else null
-                videoCapture = if (video != null && used.contains(video)) video else null
-                if (imageAnalysis == null) frameLock.withLock { latestFrame = null }
-                lastError = null
-                // ズームは束ね直すと 1 に戻るので、直前の倍率を掛け直す
-                if (zoomNow != 1f) {
-                    try {
-                        bound.cameraControl.setZoomRatio(zoomNow)
-                    } catch (e: Exception) {
-                        Log.w(TAG, "zoom restore failed", e)
-                    }
+                    finishBind(provider, null, recorder, onDone)
                 }
             } catch (e: Exception) {
                 lastError = "カメラを開始できません: ${e.message}"
                 Log.e(TAG, "bindCamera failed", e)
-            } finally {
                 onDone?.run()
             }
         }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun finishBind(provider: ProcessCameraProvider, ext: ExtensionsManager?, recorder: Recorder?, onDone: Runnable?) {
+        try {
+            provider.unbindAll()
+            imageAnalysis = null
+            imageCapture = null
+            videoCapture = null
+
+            val analysis = ImageAnalysis.Builder()
+                .setResolutionSelector(
+                    ResolutionSelector.Builder()
+                        .setResolutionStrategy(
+                            ResolutionStrategy(Size(640, 480), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER),
+                        )
+                        .build(),
+                )
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                .setTargetRotation(rotation)
+                .build()
+            analysis.setAnalyzer(analysisExecutor) { image -> handleFrame(image) }
+
+            val video = if (recorder != null) {
+                VideoCapture.Builder(recorder).setTargetRotation(rotation).build()
+            } else {
+                null
+            }
+
+            val base = if (facingValue == "user") CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
+            val attempts = ArrayList<Attempt>()
+            if (video != null) {
+                val cap = buildCapture(recording = true, withInterop = false)
+                attempts.add(Attempt(base, listOf(analysis, video, cap), "配信+録画+撮影", "なし"))
+                attempts.add(Attempt(base, listOf(analysis, video), "配信+録画", "なし"))
+                attempts.add(Attempt(base, listOf(video, cap), "録画+撮影", "なし"))
+                attempts.add(Attempt(base, listOf(video), "録画のみ", "なし"))
+            } else {
+                extensionSelector(ext, base)?.let { (sel, label) ->
+                    attempts.add(Attempt(sel, listOf(analysis, buildCapture(false, withInterop = false)), "配信+撮影", label))
+                }
+                val cap = buildCapture(recording = false, withInterop = true)
+                attempts.add(Attempt(base, listOf(analysis, cap), "配信+撮影", "なし"))
+                attempts.add(Attempt(base, listOf(analysis), "配信のみ", "なし"))
+            }
+
+            var bound: Camera? = null
+            var used: Attempt? = null
+            var lastFailure: Exception? = null
+            val notes = ArrayList<String>()
+            for (a in attempts) {
+                try {
+                    bound = provider.bindToLifecycle(this, a.selector, *a.cases.toTypedArray())
+                    used = a
+                    break
+                } catch (e: Exception) {
+                    lastFailure = e
+                    notes.add("${a.label}${if (a.extension != "なし") "(拡張${a.extension})" else ""}: ${e.message?.take(80)}")
+                    Log.w(TAG, "bind failed (${a.label}/${a.extension}): ${e.message}")
+                    provider.unbindAll()
+                }
+            }
+            bindNotes = notes.joinToString(" / ")
+            if (bound == null || used == null) {
+                boundLabel = "失敗"
+                throw lastFailure ?: IllegalStateException("bind failed")
+            }
+            camera = bound
+            boundLabel = used.label
+            extensionLabel = used.extension
+            imageAnalysis = used.cases.filterIsInstance<ImageAnalysis>().firstOrNull()
+            imageCapture = used.cases.filterIsInstance<ImageCapture>().firstOrNull()
+            videoCapture = if (video != null && used.cases.contains(video)) video else null
+            if (imageAnalysis == null) frameLock.withLock { latestFrame = null }
+            lastError = null
+            // ズームは束ね直すと 1 に戻るので、直前の倍率を掛け直す
+            if (zoomNow != 1f) {
+                try {
+                    bound.cameraControl.setZoomRatio(zoomNow)
+                } catch (e: Exception) {
+                    Log.w(TAG, "zoom restore failed", e)
+                }
+            }
+        } catch (e: Exception) {
+            lastError = "カメラを開始できません: ${e.message}"
+            Log.e(TAG, "bindCamera failed", e)
+        } finally {
+            diagText = buildDiag()
+            onDone?.run()
+        }
     }
 
     /** メインスレッドで束ね直し、終わるまで待つ（HTTP のスレッドから呼ぶ） */
@@ -487,22 +595,14 @@ class CameraService : LifecycleService(), CameraController {
         val cap = imageCapture
             ?: throw IllegalStateException(if (activeRecording != null) "この端末では録画中に撮影できません" else "カメラが起動していません")
 
-        val name = "G2_" + SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
-        val values = ContentValues().apply {
-            put(MediaStore.Images.Media.DISPLAY_NAME, name)
-            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-            put(MediaStore.Images.Media.RELATIVE_PATH, RELATIVE_DIR)
-        }
-        val options = ImageCapture.OutputFileOptions
-            .Builder(contentResolver, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-            .build()
+        // いったんメモリに受けて、すぐ保存先（選んだフォルダ or 写真アプリ）へ書く。読み戻しはしない
+        val buffer = ByteArrayOutputStream(4 * 1024 * 1024)
+        val options = ImageCapture.OutputFileOptions.Builder(buffer).build()
 
         val latch = CountDownLatch(1)
-        var savedUri: Uri? = null
         var failure: Throwable? = null
         cap.takePicture(options, ioExecutor, object : ImageCapture.OnImageSavedCallback {
             override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-                savedUri = output.savedUri
                 latch.countDown()
             }
 
@@ -511,11 +611,15 @@ class CameraService : LifecycleService(), CameraController {
                 latch.countDown()
             }
         })
-        if (!latch.await(10, TimeUnit.SECONDS)) throw IllegalStateException("撮影がタイムアウトしました")
+        // 拡張（HDR・夜景）の撮影は数秒かかることがある
+        if (!latch.await(20, TimeUnit.SECONDS)) throw IllegalStateException("撮影がタイムアウトしました")
         failure?.let { throw it }
-        val uri = savedUri ?: throw IllegalStateException("保存先が取得できません")
-        val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
-            ?: throw IllegalStateException("保存した写真を読めません")
+        val bytes = buffer.toByteArray()
+        val name = "G2_" + SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
+        val uri = Storage.saveImage(this, bytes, name)
+        if (uri == null) {
+            lastError = "写真を保存できません（保存先を確認してください）"
+        }
         photosTaken++
         bytes
     }
@@ -535,29 +639,53 @@ class CameraService : LifecycleService(), CameraController {
         // 録画の間は VideoCapture を加えて束ね直す（サムネイルは束ね直す前の最新フレーム）
         recordingThumb = latestFrame?.bytes
         val recorder = Recorder.Builder()
-            .setExecutor(ioExecutor)
+            .setExecutor(recorderExecutor)
             .setQualitySelector(QualitySelector.from(qualityOf(quality), FallbackStrategy.lowerQualityOrHigherThan(Quality.SD)))
             .build()
         rebindAndWait(recorder)
         val vc = videoCapture
         if (vc == null) {
-            // 録画できる組み合わせが無かった。元の配信＋撮影に戻す
+            // 録画できる組み合わせが無かった。理由を控えてから、元の配信＋撮影に戻す
+            val reason = lastError ?: "この端末では録画を開始できません"
+            val notes = bindNotes
             rebindAndWait(null)
-            throw IllegalStateException(lastError ?: "この端末では録画を開始できません")
+            throw IllegalStateException("$reason${if (notes.isNotEmpty()) "（$notes）" else ""}")
         }
 
         val name = "G2_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".mp4"
-        val values = ContentValues().apply {
-            put(MediaStore.Video.Media.DISPLAY_NAME, name)
-            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-            put(MediaStore.Video.Media.RELATIVE_PATH, RELATIVE_DIR)
-        }
-        val options = MediaStoreOutputOptions.Builder(contentResolver, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
-            .setContentValues(values)
-            .build()
+        // 保存先：選んだフォルダがあればそこへ直接、無ければ写真アプリ（DCIM/G2Camera）
+        val target = Storage.openVideoInTree(this, name)
+        customVideoUri = target?.uri
         val withAudio = audio && audioPermitted
-        var pending = vc.output.prepareRecording(this, options)
-        if (withAudio) pending = pending.withAudioEnabled()
+        var pending = try {
+            if (target != null) {
+                vc.output.prepareRecording(this, FileDescriptorOutputOptions.Builder(target.pfd).build())
+            } else {
+                val values = ContentValues().apply {
+                    put(MediaStore.Video.Media.DISPLAY_NAME, name)
+                    put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                    put(MediaStore.Video.Media.RELATIVE_PATH, RELATIVE_DIR)
+                }
+                vc.output.prepareRecording(
+                    this,
+                    MediaStoreOutputOptions.Builder(contentResolver, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+                        .setContentValues(values)
+                        .build(),
+                )
+            }
+        } catch (e: Exception) {
+            target?.let { closeQuietly(it); Storage.deleteQuietly(this, it.uri) }
+            customVideoUri = null
+            rebindAndWait(null)
+            throw IllegalStateException("録画の準備に失敗: ${e.message}")
+        }
+        if (withAudio) {
+            try {
+                pending = pending.withAudioEnabled()
+            } catch (e: Exception) {
+                Log.w(TAG, "audio enable failed", e)
+            }
+        }
 
         val state = RecordingState(
             name = name,
@@ -582,9 +710,10 @@ class CameraService : LifecycleService(), CameraController {
                 is VideoRecordEvent.Finalize -> {
                     state.durationMs = event.recordingStats.recordedDurationNanos / 1_000_000L
                     state.bytes = event.recordingStats.numBytesRecorded
-                    if (event.hasError() && event.outputResults.outputUri == Uri.EMPTY) {
+                    if (event.hasError() && event.recordingStats.numBytesRecorded == 0L) {
                         startFailure = "録画に失敗（コード ${event.error}）: ${event.cause?.message ?: ""}"
                     }
+                    target?.let { closeQuietly(it) }
                     finalizeEvent = event
                     fin.countDown()
                     started.countDown()
@@ -595,11 +724,15 @@ class CameraService : LifecycleService(), CameraController {
         if (!started.await(8, TimeUnit.SECONDS)) {
             activeRecording?.close()
             activeRecording = null
+            target?.let { closeQuietly(it); Storage.deleteQuietly(this, it.uri) }
+            customVideoUri = null
             rebindAndWait(null)
-            throw IllegalStateException("録画が始まりません（タイムアウト）")
+            throw IllegalStateException("録画が始まりません（タイムアウト。構成=$boundLabel）")
         }
         startFailure?.let {
             activeRecording = null
+            target?.let { t -> Storage.deleteQuietly(this, t.uri) }
+            customVideoUri = null
             rebindAndWait(null)
             throw IllegalStateException(it)
         }
@@ -646,7 +779,8 @@ class CameraService : LifecycleService(), CameraController {
         recordingState = null
         recordingLabel = null
         val ev = finalizeEvent
-        val uri = ev?.outputResults?.outputUri?.takeIf { it != Uri.EMPTY }
+        val uri = ev?.outputResults?.outputUri?.takeIf { it != Uri.EMPTY } ?: customVideoUri
+        customVideoUri = null
         val name = state?.name ?: "recording.mp4"
         if (uri != null) recentFiles[name] = uri
         val error = if (ev == null) {
@@ -678,7 +812,7 @@ class CameraService : LifecycleService(), CameraController {
     }
 
     override fun openRecording(name: String): Pair<InputStream, Long>? {
-        var uri = recentFiles[name]
+        var uri = recentFiles[name] ?: Storage.findInTree(this, name)
         var size = -1L
         if (uri == null) {
             val proj = arrayOf(MediaStore.Video.Media._ID, MediaStore.Video.Media.SIZE)
@@ -703,6 +837,14 @@ class CameraService : LifecycleService(), CameraController {
             return Pair(bytes.inputStream(), bytes.size.toLong())
         }
         return Pair(stream, size)
+    }
+
+    private fun closeQuietly(t: Storage.VideoTarget) {
+        try {
+            t.pfd.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "pfd close failed", e)
+        }
     }
 
     private fun formatDuration(ms: Long): String {

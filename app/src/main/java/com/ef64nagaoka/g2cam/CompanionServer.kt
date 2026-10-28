@@ -76,6 +76,8 @@ interface CameraController {
     // ── 録画 ──
     /** 録音の権限があるか（無ければ無音で録画する） */
     val audioPermitted: Boolean
+    /** カメラ構成・静止画の拡張・保存先・束ね直しの失敗理由（診断用） */
+    val diag: String
     /** 録画中の状態。録画していなければ null */
     val recording: RecordingState?
     /** 録画を始める（ブロッキング。始まるまで待つ）。すでに録画中ならその状態を返す */
@@ -220,7 +222,8 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
         JSONObject()
             .put("ok", true)
             .put("app", "g2cam-companion")
-            .put("version", "1.2")
+            .put("version", "1.3")
+            .put("diag", camera.diag)
             .put("facing", camera.facing)
             .put("width", camera.frameWidth)
             .put("height", camera.frameHeight)

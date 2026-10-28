@@ -12,8 +12,8 @@ android {
         // 30 以上: camera 種別のフォアグラウンドサービス定数があり、MediaStore で DCIM に直接保存できる
         minSdk = 30
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.2"
+        versionCode = 3
+        versionName = "1.3"
     }
 
     compileOptions {
@@ -34,6 +34,7 @@ dependencies {
     implementation("androidx.camera:camera-camera2:$camerax")
     implementation("androidx.camera:camera-lifecycle:$camerax")
     implementation("androidx.camera:camera-video:$camerax")
+    implementation("androidx.camera:camera-extensions:$camerax")
 
     implementation("org.nanohttpd:nanohttpd:2.3.1")
 }
