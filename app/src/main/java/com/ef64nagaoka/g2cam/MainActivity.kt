@@ -139,6 +139,21 @@ class MainActivity : Activity() {
             }
         })
         root.addView(CheckBox(this).apply {
+            text = "G2 カメラを開いたら自動でカメラを開始する（待機モード。通知を出して常駐します）"
+            isChecked = Prefs.standby(this@MainActivity)
+            setOnCheckedChangeListener { _, checked ->
+                Prefs.setStandby(this@MainActivity, checked)
+                if (checked) StandbyService.start(this@MainActivity) else StandbyService.stop(this@MainActivity)
+                handler.postDelayed({ render() }, 300)
+            }
+        })
+        root.addView(Button(this).apply {
+            text = "「他のアプリの上に表示」を許可する（待機モードに必要）"
+            setOnClickListener {
+                startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+            }
+        })
+        root.addView(CheckBox(this).apply {
             text = "静止画を高画質で撮る（端末のHDR・オート機能を使う。非対応の端末では通常撮影）。反映は次にカメラを開始したとき"
             isChecked = Prefs.highQuality(this@MainActivity)
             setOnCheckedChangeListener { _, checked -> Prefs.setHighQuality(this@MainActivity, checked) }
@@ -162,7 +177,7 @@ class MainActivity : Activity() {
 
         root.addView(TextView(this).apply {
             text = "使いかた\n" +
-                "・G2 カメラを開くと、自動でこのアプリが起動してカメラを始めます（G2 カメラを終了すると自動で止まります）。\n" +
+                "・G2 カメラを開くと自動でカメラを始めるには、上の「待機モード」をオンにして「他のアプリの上に表示」を許可してください（G2 カメラを終了すると自動で止まります）。\n" +
                 "・起動しないときは、このアプリを開いて「カメラを開始」を押してから G2 カメラを開いてください（この画面を出したまま押すこと。Android の制約で、裏からは開始できません）。\n" +
                 "・画面を消しても通知が出ている間は動きます。手で止めるときは「停止」\n" +
                 "・録画は G2 カメラのメニュー「動画 録画/停止」から。写真も動画も、上で選んだ保存先にすぐ保存されます（選ばなければ「写真」アプリの G2Camera フォルダ。音声はマイクの許可があるときだけ）\n\n" +
@@ -225,6 +240,11 @@ class MainActivity : Activity() {
         lines.add("カメラ権限：" + if (camera) "OK" else "未許可")
         lines.add("録画の音声（マイク）：" + if (mic) "OK" else "未許可（無音で録画。許可はアプリ情報から）")
         lines.add("電池の最適化の除外：" + if (battery) "OK" else "未設定（推奨）")
+        val overlayOk = Settings.canDrawOverlays(this)
+        lines.add(
+            "待機モード：" + (if (StandbyService.running) "● 待機中（起動要求 ${StandbyService.launchCount} 回）" else "○ オフ") +
+                "　他のアプリの上に表示：" + if (overlayOk) "OK" else "未許可",
+        )
         CameraService.lastError?.let { lines.add("⚠ $it") }
         CameraService.diagText?.let { lines.add("構成：$it") }
         saveDir.text = "保存先：" + Storage.describe(this)

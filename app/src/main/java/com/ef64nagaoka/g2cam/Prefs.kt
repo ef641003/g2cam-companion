@@ -8,6 +8,7 @@ object Prefs {
     private const val KEY_AUTO_STOP = "autoStop"
     private const val KEY_SAVE_TREE = "saveTree"
     private const val KEY_HQ = "highQuality"
+    private const val KEY_STANDBY = "standby"
 
     private fun sp(context: Context) = context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
 
@@ -30,5 +31,12 @@ object Prefs {
 
     fun setHighQuality(context: Context, value: Boolean) {
         sp(context).edit().putBoolean(KEY_HQ, value).apply()
+    }
+
+    /** G2 カメラの起動を待つ「待機」を常駐させる */
+    fun standby(context: Context): Boolean = sp(context).getBoolean(KEY_STANDBY, false)
+
+    fun setStandby(context: Context, value: Boolean) {
+        sp(context).edit().putBoolean(KEY_STANDBY, value).apply()
     }
 }
