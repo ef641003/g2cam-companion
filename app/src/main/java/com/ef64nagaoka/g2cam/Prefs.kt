@@ -9,6 +9,7 @@ object Prefs {
     private const val KEY_SAVE_TREE = "saveTree"
     private const val KEY_HQ = "highQuality"
     private const val KEY_STANDBY = "standby"
+    private const val KEY_STAB = "stabilization"
 
     private fun sp(context: Context) = context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
 
@@ -38,5 +39,12 @@ object Prefs {
 
     fun setStandby(context: Context, value: Boolean) {
         sp(context).edit().putBoolean(KEY_STANDBY, value).apply()
+    }
+
+    /** 手ブレ補正（光学式があれば静止画・配信で、動画は電子式も）を使う */
+    fun stabilization(context: Context): Boolean = sp(context).getBoolean(KEY_STAB, true)
+
+    fun setStabilization(context: Context, value: Boolean) {
+        sp(context).edit().putBoolean(KEY_STAB, value).apply()
     }
 }

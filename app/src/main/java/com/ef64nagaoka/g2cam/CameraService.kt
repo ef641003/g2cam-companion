@@ -12,6 +12,8 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.net.Uri
 import android.os.Handler
@@ -147,10 +149,11 @@ class CameraService : LifecycleService(), CameraController {
     @Volatile private var boundLabel = "未起動"
     @Volatile private var extensionLabel = "なし"
     @Volatile private var bindNotes = ""
+    @Volatile private var stabLabel = "なし"
     override val diag: String
         get() = buildDiag()
 
-    private fun buildDiag(): String = "構成=$boundLabel・静止画の拡張=$extensionLabel・保存先=${Storage.describe(this)}" +
+    private fun buildDiag(): String = "構成=$boundLabel・静止画の拡張=$extensionLabel・手ブレ補正=$stabLabel・保存先=${Storage.describe(this)}" +
             (if (bindNotes.isNotEmpty()) "・束ね直しの失敗=$bindNotes" else "")
     /** このサービスで録画したファイル（名前 → URI）。/file で返すときに使う */
     private val recentFiles = HashMap<String, Uri>()
@@ -335,6 +338,20 @@ class CameraService : LifecycleService(), CameraController {
     /** 束ね方の候補ひとつ */
     private class Attempt(val selector: CameraSelector, val cases: List<UseCase>, val label: String, val extension: String)
 
+    /** 光学式手ブレ補正（OIS）が使える端末か */
+    private fun oisSupported(): Boolean = try {
+        val cm = getSystemService(CameraManager::class.java)
+        val want = if (facingValue == "user") CameraCharacteristics.LENS_FACING_FRONT else CameraCharacteristics.LENS_FACING_BACK
+        cm.cameraIdList.any { id ->
+            val c = cm.getCameraCharacteristics(id)
+            c.get(CameraCharacteristics.LENS_FACING) == want &&
+                c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
+                    ?.contains(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON) == true
+        }
+    } catch (e: Exception) {
+        false
+    }
+
     /** 静止画のユースケース。高画質モードなら最高画質・最大解像度・ノイズ低減と輪郭を高品質に */
     @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
     private fun buildCapture(recording: Boolean, withInterop: Boolean): ImageCapture {
@@ -364,6 +381,14 @@ class CameraService : LifecycleService(), CameraController {
                 }
             }
         }
+        if (withInterop && Prefs.stabilization(this) && oisSupported()) {
+            try {
+                Camera2Interop.Extender(b)
+                    .setCaptureRequestOption(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)
+            } catch (e: Exception) {
+                Log.w(TAG, "ois failed", e)
+            }
+        }
         return b.build()
     }
 
@@ -387,7 +412,7 @@ class CameraService : LifecycleService(), CameraController {
      * 端末が同時に使えない組み合わせのときは、撮影 → 配信の順に外して試す。
      * 高画質モードでは、先に端末のカメラ拡張つき（HDR 等）で試し、だめなら通常に戻す。
      */
-    private fun bindCamera(recorder: Recorder?, onDone: Runnable?) {
+    private fun bindCamera(recorder: Recorder?, onDone: Runnable?, stabilize: Boolean = false) {
         val future = ProcessCameraProvider.getInstance(this)
         future.addListener({
             try {
@@ -401,10 +426,10 @@ class CameraService : LifecycleService(), CameraController {
                             Log.w(TAG, "extensions unavailable", e)
                             null
                         }
-                        finishBind(provider, ext, recorder, onDone)
+                        finishBind(provider, ext, recorder, onDone, stabilize)
                     }, ContextCompat.getMainExecutor(this))
                 } else {
-                    finishBind(provider, null, recorder, onDone)
+                    finishBind(provider, null, recorder, onDone, stabilize)
                 }
             } catch (e: Exception) {
                 lastError = "カメラを開始できません: ${e.message}"
@@ -414,14 +439,16 @@ class CameraService : LifecycleService(), CameraController {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    private fun finishBind(provider: ProcessCameraProvider, ext: ExtensionsManager?, recorder: Recorder?, onDone: Runnable?) {
+    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
+    private fun finishBind(provider: ProcessCameraProvider, ext: ExtensionsManager?, recorder: Recorder?, onDone: Runnable?, stabilize: Boolean) {
         try {
             provider.unbindAll()
             imageAnalysis = null
             imageCapture = null
             videoCapture = null
 
-            val analysis = ImageAnalysis.Builder()
+            val ois = Prefs.stabilization(this) && oisSupported()
+            val analysisBuilder = ImageAnalysis.Builder()
                 .setResolutionSelector(
                     ResolutionSelector.Builder()
                         .setResolutionStrategy(
@@ -432,11 +459,19 @@ class CameraService : LifecycleService(), CameraController {
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .setTargetRotation(rotation)
-                .build()
+            if (ois) {
+                try {
+                    Camera2Interop.Extender(analysisBuilder)
+                        .setCaptureRequestOption(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)
+                } catch (e: Exception) {
+                    Log.w(TAG, "ois (analysis) failed", e)
+                }
+            }
+            val analysis = analysisBuilder.build()
             analysis.setAnalyzer(analysisExecutor) { image -> handleFrame(image) }
 
             val video = if (recorder != null) {
-                VideoCapture.Builder(recorder).setTargetRotation(rotation).build()
+                VideoCapture.Builder(recorder).setTargetRotation(rotation).setVideoStabilizationEnabled(stabilize).build()
             } else {
                 null
             }
@@ -481,6 +516,8 @@ class CameraService : LifecycleService(), CameraController {
             }
             camera = bound
             boundLabel = used.label
+            val withVideo = video != null && used.cases.contains(video)
+            stabLabel = "光学" + (if (ois) "あり" else "なし") + "・動画の電子式" + (if (!withVideo) "（録画していない）" else if (stabilize) "オン" else "オフ")
             extensionLabel = used.extension
             imageAnalysis = used.cases.filterIsInstance<ImageAnalysis>().firstOrNull()
             imageCapture = used.cases.filterIsInstance<ImageCapture>().firstOrNull()
@@ -505,9 +542,9 @@ class CameraService : LifecycleService(), CameraController {
     }
 
     /** メインスレッドで束ね直し、終わるまで待つ（HTTP のスレッドから呼ぶ） */
-    private fun rebindAndWait(recorder: Recorder?) {
+    private fun rebindAndWait(recorder: Recorder?, stabilize: Boolean = false) {
         val latch = CountDownLatch(1)
-        mainHandler.post { bindCamera(recorder, Runnable { latch.countDown() }) }
+        mainHandler.post { bindCamera(recorder, Runnable { latch.countDown() }, stabilize) }
         if (!latch.await(6, TimeUnit.SECONDS)) throw IllegalStateException("カメラの切り替えがタイムアウトしました")
     }
 
@@ -638,12 +675,20 @@ class CameraService : LifecycleService(), CameraController {
 
         // 録画の間は VideoCapture を加えて束ね直す（サムネイルは束ね直す前の最新フレーム）
         recordingThumb = latestFrame?.bytes
-        val recorder = Recorder.Builder()
+        fun newRecorder() = Recorder.Builder()
             .setExecutor(recorderExecutor)
             .setQualitySelector(QualitySelector.from(qualityOf(quality), FallbackStrategy.lowerQualityOrHigherThan(Quality.SD)))
             .build()
-        rebindAndWait(recorder)
-        val vc = videoCapture
+        // 手ブレ補正つきで束ねてみて、端末が受け付けなければ補正なしでやり直す
+        val wantStab = Prefs.stabilization(this)
+        rebindAndWait(newRecorder(), wantStab)
+        var vc = videoCapture
+        if (vc == null && wantStab) {
+            val why = lastError ?: bindNotes
+            Log.w(TAG, "動画の手ブレ補正つきでは束ねられません。補正なしでやり直します: $why")
+            rebindAndWait(newRecorder(), false)
+            vc = videoCapture
+        }
         if (vc == null) {
             // 録画できる組み合わせが無かった。理由を控えてから、元の配信＋撮影に戻す
             val reason = lastError ?: "この端末では録画を開始できません"

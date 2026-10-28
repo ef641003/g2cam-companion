@@ -154,6 +154,11 @@ class MainActivity : Activity() {
             }
         })
         root.addView(CheckBox(this).apply {
+            text = "手ブレ補正を使う（光学式があれば静止画・配信に、動画は電子式も。非対応の端末では自動で外れます）。反映は次にカメラを開始したとき"
+            isChecked = Prefs.stabilization(this@MainActivity)
+            setOnCheckedChangeListener { _, checked -> Prefs.setStabilization(this@MainActivity, checked) }
+        })
+        root.addView(CheckBox(this).apply {
             text = "静止画を高画質で撮る（端末のHDR・オート機能を使う。非対応の端末では通常撮影）。反映は次にカメラを開始したとき"
             isChecked = Prefs.highQuality(this@MainActivity)
             setOnCheckedChangeListener { _, checked -> Prefs.setHighQuality(this@MainActivity, checked) }

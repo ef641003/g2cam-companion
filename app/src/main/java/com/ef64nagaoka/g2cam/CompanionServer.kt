@@ -222,7 +222,7 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
         JSONObject()
             .put("ok", true)
             .put("app", "g2cam-companion")
-            .put("version", "1.4")
+            .put("version", "1.5")
             .put("diag", camera.diag)
             .put("facing", camera.facing)
             .put("width", camera.frameWidth)
