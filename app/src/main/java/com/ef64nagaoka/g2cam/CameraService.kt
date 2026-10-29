@@ -168,12 +168,15 @@ class CameraService : LifecycleService(), CameraController {
     @Volatile private var pendingResult: RecordResult? = null
 
     // G2 カメラ側とのつながり（終了に合わせた自動停止）
+    /** 録画中に G2 カメラが終了した。録画が終わったらサービスを止める */
+    @Volatile private var stopWhenRecordingEnds = false
     @Volatile private var lastClientAt = 0L
     @Volatile private var clientSeen = false
     private val idleWatchdog = object : Runnable {
         override fun run() {
             val idle = SystemClock.elapsedRealtime() - lastClientAt
-            if (clientSeen && idle > IDLE_STOP_MS && Prefs.autoStop(this@CameraService)) {
+            // 録画中は、メガネ・G2 カメラとの接続が切れても止めない（録画が終わってから判断する）
+            if (activeRecording == null && clientSeen && idle > IDLE_STOP_MS && Prefs.autoStop(this@CameraService)) {
                 Log.i(TAG, "G2 カメラからの応答が ${idle / 1000} 秒途絶えたので停止します")
                 shutdownGracefully()
                 return
@@ -639,6 +642,8 @@ class CameraService : LifecycleService(), CameraController {
                 val f = latestFrame
                 if (f != null && f.seq > afterSeq) {
                     framesServed++
+                    // 映像を取りに来ている = G2 カメラがまた動いている。録画後の自動停止は取り消す
+                    stopWhenRecordingEnds = false
                     return f
                 }
                 if (remainNs <= 0L) return null
@@ -654,6 +659,12 @@ class CameraService : LifecycleService(), CameraController {
 
     override fun requestStop(): Boolean {
         if (!Prefs.autoStop(this)) return false
+        // 録画中なら、録画をそのまま続ける。録画が終わったあとに止める
+        if (activeRecording != null) {
+            Log.i(TAG, "G2 カメラが終了しましたが、録画中なので続けます（録画が終わったら止めます）")
+            stopWhenRecordingEnds = true
+            return true
+        }
         // 返事を返し終えてから止める（録画中なら保存してから）
         mainHandler.postDelayed({ shutdownGracefully() }, 300)
         return true
@@ -904,6 +915,12 @@ class CameraService : LifecycleService(), CameraController {
             if (running) rebindAndWait(null)
         } catch (e: Exception) {
             Log.w(TAG, "rebind after recording failed", e)
+        }
+        // 録画中に G2 カメラが終了していたなら、録画が済んだのでサービスも止める
+        // （動画はすでに保存先に残っている。G2 カメラのギャラリーに載る記録は、止めずに待った場合だけ受け取れる）
+        if (stopWhenRecordingEnds && Prefs.autoStop(this)) {
+            stopWhenRecordingEnds = false
+            mainHandler.post { shutdownGracefully() }
         }
         return result
     }
