@@ -359,18 +359,26 @@ class CameraService : LifecycleService(), CameraController {
         false
     }
 
-    /** 動画の電子式手ブレ補正（EIS）が使える端末か */
-    private fun eisSupported(): Boolean = try {
+    /** 使っているカメラの映像の手ブレ補正モード（0=なし 1=通常 2=プレビュー安定化）のうち、端末が対応しているもの */
+    private fun availableStabModes(): IntArray = try {
         val cm = getSystemService(CameraManager::class.java)
         val want = if (facingValue == "user") CameraCharacteristics.LENS_FACING_FRONT else CameraCharacteristics.LENS_FACING_BACK
-        cm.cameraIdList.any { id ->
-            val c = cm.getCameraCharacteristics(id)
-            c.get(CameraCharacteristics.LENS_FACING) == want &&
-                c.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
-                    ?.contains(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON) == true
-        }
+        cm.cameraIdList
+            .map { cm.getCameraCharacteristics(it) }
+            .firstOrNull { it.get(CameraCharacteristics.LENS_FACING) == want }
+            ?.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES) ?: intArrayOf()
     } catch (e: Exception) {
-        false
+        intArrayOf()
+    }
+
+    /** 使う電子式手ブレ補正のモード。強い方（プレビュー安定化 = 2。Android 13 以降）を優先、無ければ通常（1）、無ければ null */
+    private fun chooseEisMode(): Int? {
+        val modes = availableStabModes()
+        return when {
+            android.os.Build.VERSION.SDK_INT >= 33 && modes.contains(2) -> 2
+            modes.contains(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON) -> CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON
+            else -> null
+        }
     }
 
     /** 静止画のユースケース。高画質モードなら最高画質・最大解像度・ノイズ低減と輪郭を高品質に */
@@ -488,16 +496,26 @@ class CameraService : LifecycleService(), CameraController {
                     Log.w(TAG, "ois (analysis) failed", e)
                 }
             }
+            // 録画中は、配信も録画と同じモードで安定化する（束ねたカメラ全体で 1 つのモードに揃える）
+            val eisMode = if (stabilize) chooseEisMode() else null
+            if (eisMode != null) {
+                try {
+                    Camera2Interop.Extender(analysisBuilder)
+                        .setCaptureRequestOption(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, eisMode)
+                } catch (e: Exception) {
+                    Log.w(TAG, "eis (analysis) failed", e)
+                }
+            }
             val analysis = analysisBuilder.build()
             analysis.setAnalyzer(analysisExecutor) { image -> handleFrame(image) }
 
             var eisOn = false
             val video = if (recorder != null) {
                 val vb = VideoCapture.Builder(recorder).setTargetRotation(rotation)
-                if (stabilize && eisSupported()) {
+                if (eisMode != null) {
                     try {
                         Camera2Interop.Extender(vb)
-                            .setCaptureRequestOption(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)
+                            .setCaptureRequestOption(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, eisMode)
                         eisOn = true
                     } catch (e: Exception) {
                         Log.w(TAG, "eis failed", e)
@@ -549,7 +567,9 @@ class CameraService : LifecycleService(), CameraController {
             camera = bound
             boundLabel = used.label
             val withVideo = video != null && used.cases.contains(video)
-            stabLabel = "光学" + (if (ois) "あり" else "なし") + "・動画の電子式" + (if (!withVideo) "（録画していない）" else if (eisOn) "オン" else "オフ")
+            stabLabel = "光学" + (if (ois) "あり" else "なし") + "・動画の電子式" +
+                (if (!withVideo) "（録画していない）" else if (eisOn) (if (eisMode == 2) "オン（プレビュー安定化）" else "オン（通常）") else "オフ") +
+                "・端末の対応モード=" + availableStabModes().joinToString(",")
             extensionLabel = used.extension
             imageAnalysis = used.cases.filterIsInstance<ImageAnalysis>().firstOrNull()
             imageCapture = used.cases.filterIsInstance<ImageCapture>().firstOrNull()
