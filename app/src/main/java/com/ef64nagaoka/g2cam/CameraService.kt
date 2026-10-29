@@ -98,6 +98,13 @@ class CameraService : LifecycleService(), CameraController {
     override val facing: String get() = facingValue
     override val frameWidth: Int get() = frameW
     override val frameHeight: Int get() = frameH
+    override val appVersion: String by lazy {
+        try {
+            packageManager.getPackageInfo(packageName, 0).versionName ?: "?"
+        } catch (e: Exception) {
+            "?"
+        }
+    }
 
     @Volatile private var zoomNow = 1f
     override val zoom: Float get() = zoomNow

@@ -46,6 +46,8 @@ interface CameraController {
     val facing: String
     val frameWidth: Int
     val frameHeight: Int
+    /** このアプリの版（G2 カメラと同じ番号） */
+    val appVersion: String
 
     /** レンズのズーム範囲と現在の倍率（1.0 = 標準レンズ。1 未満は超広角、1 超は望遠・光学ズーム） */
     val zoomMin: Float
@@ -222,7 +224,7 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
         JSONObject()
             .put("ok", true)
             .put("app", "g2cam-companion")
-            .put("version", "1.5")
+            .put("version", camera.appVersion)
             .put("diag", camera.diag)
             .put("facing", camera.facing)
             .put("width", camera.frameWidth)

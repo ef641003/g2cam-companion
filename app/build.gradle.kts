@@ -12,8 +12,8 @@ android {
         // 30 以上: camera 種別のフォアグラウンドサービス定数があり、MediaStore で DCIM に直接保存できる
         minSdk = 30
         targetSdk = 34
-        versionCode = 5
-        versionName = "1.5"
+        versionCode = 106
+        versionName = "0.1.6"
     }
 
     compileOptions {
