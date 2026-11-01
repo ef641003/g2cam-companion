@@ -32,18 +32,26 @@ jobs:
           set -o pipefail
           gradle --no-daemon assembleDebug 2>&1 | tee build.log
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: g2cam-companion-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+      # 遡り録画の区切りの計算（PreRollPlan）など、端末の要らない試験。APK を置いてから走らせる
+      - name: 単体試験
+        run: |
+          set -o pipefail
+          echo "===== 単体試験 =====" >> build.log
+          gradle --no-daemon testDebugUnitTest 2>&1 | tee -a build.log
+
       # 失敗の原因を読めるよう、ビルドログを build-log ブランチに置く
       - name: ビルドログを build-log ブランチへ
         if: always()
         run: |
           mkdir -p /tmp/bl && cp build.log /tmp/bl/ 2>/dev/null || true
+          cp -r app/build/reports/tests /tmp/bl/unit-tests 2>/dev/null || true
           cd /tmp/bl
           git init -q -b build-log
           git add -A
           git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qm "build log ${{ github.run_number }}" || true
           git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" build-log || true
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: g2cam-companion-debug
-          path: app/build/outputs/apk/debug/app-debug.apk

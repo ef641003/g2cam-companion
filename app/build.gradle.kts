@@ -12,8 +12,9 @@ android {
         // 30 以上: camera 種別のフォアグラウンドサービス定数があり、MediaStore で DCIM に直接保存できる
         minSdk = 30
         targetSdk = 34
-        versionCode = 110
-        versionName = "0.1.10"
+        versionCode = 111
+        versionName = "0.1.11"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     compileOptions {
@@ -37,4 +38,11 @@ dependencies {
     implementation("androidx.camera:camera-extensions:$camerax")
 
     implementation("org.nanohttpd:nanohttpd:2.3.1")
+
+    // 遡り録画のつなぎ合わせ（Mp4Merger）と区切りの計算（PreRollPlan）の試験
+    testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test:runner:1.5.2")
+    androidTestImplementation("androidx.test:core:1.5.0")
+    androidTestImplementation("androidx.test.ext:junit:1.1.5")
 }

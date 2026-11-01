@@ -113,6 +113,94 @@ object Storage {
         }
     }
 
+    /**
+     * 自分で書く動画（遡り録画をつないだもの）の書き出し先。
+     * 選んだフォルダがあればそこ、無ければ写真アプリ（DCIM/G2Camera。書き終えるまで「保留中」にして写真アプリに出さない）。
+     * MediaMuxer は読み書き・シークできる記述子を要るので "rw" で開く。
+     */
+    class VideoOutput(val uri: Uri, val pfd: ParcelFileDescriptor, private val mediaStore: Boolean) {
+        /** 書き終えた：写真アプリに出す */
+        fun publish(context: Context) {
+            try {
+                pfd.close()
+            } catch (_: Exception) {
+            }
+            if (mediaStore) {
+                try {
+                    val v = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
+                    context.contentResolver.update(uri, v, null, null)
+                } catch (e: Exception) {
+                    Log.w(TAG, "publish failed", e)
+                }
+            }
+        }
+
+        /** 失敗した：作りかけを消す */
+        fun discard(context: Context) {
+            try {
+                pfd.close()
+            } catch (_: Exception) {
+            }
+            try {
+                if (mediaStore) context.contentResolver.delete(uri, null, null) else DocumentsContract.deleteDocument(context.contentResolver, uri)
+            } catch (e: Exception) {
+                Log.w(TAG, "discard failed", e)
+            }
+        }
+    }
+
+    fun openVideoOutput(context: Context, name: String): VideoOutput? {
+        val resolver = context.contentResolver
+        tree(context)?.let { tree ->
+            try {
+                val uri = createInTree(context, tree, name, "video/mp4")
+                if (uri != null) {
+                    val pfd = resolver.openFileDescriptor(uri, "rw")
+                    if (pfd != null) return VideoOutput(uri, pfd, false)
+                    deleteQuietly(context, uri)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "選んだフォルダに動画を作れません。既定に保存します", e)
+            }
+        }
+        return try {
+            val values = ContentValues().apply {
+                put(MediaStore.Video.Media.DISPLAY_NAME, name)
+                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                put(MediaStore.Video.Media.RELATIVE_PATH, RELATIVE_DIR)
+                put(MediaStore.Video.Media.IS_PENDING, 1)
+            }
+            val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values) ?: return null
+            val pfd = resolver.openFileDescriptor(uri, "rw")
+            if (pfd == null) {
+                resolver.delete(uri, null, null)
+                null
+            } else {
+                VideoOutput(uri, pfd, true)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "動画の書き出し先を作れません", e)
+            null
+        }
+    }
+
+    /** ファイルをそのまま保存先へ写す（つなぎ合わせに失敗したときの保険）。写した URI を返す */
+    fun copyVideo(context: Context, file: java.io.File, name: String): Uri? {
+        val out = openVideoOutput(context, name) ?: return null
+        return try {
+            java.io.FileOutputStream(out.pfd.fileDescriptor).use { os ->
+                file.inputStream().use { it.copyTo(os, 1 shl 20) }
+                os.fd.sync()
+            }
+            out.publish(context)
+            out.uri
+        } catch (e: Exception) {
+            Log.e(TAG, "動画を写せません: ${file.name}", e)
+            out.discard(context)
+            null
+        }
+    }
+
     /** 中身が空の動画ファイルを消す（録画が失敗したとき） */
     fun deleteQuietly(context: Context, uri: Uri) {
         try {

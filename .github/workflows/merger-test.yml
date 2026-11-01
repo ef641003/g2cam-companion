@@ -1,0 +1,68 @@
+name: つなぎ合わせの試験（エミュレーター）
+
+# 遡り録画のつなぎ合わせ（Mp4Merger）を、エミュレーターの符号化器で作った本物の MP4 で確かめる
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app/src/main/java/com/ef64nagaoka/g2cam/Mp4Merger.kt'
+      - 'app/src/androidTest/**'
+      - '.github/workflows/merger-test.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: KVM を使えるようにする
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: SDK ライセンスに同意
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: 試験用の APK をビルド
+        run: |
+          set -o pipefail
+          gradle --no-daemon assembleDebug assembleDebugAndroidTest 2>&1 | tee test.log
+
+      - name: エミュレーターで試験
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          target: default
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -camera-front none
+          disable-animations: true
+          script: bash -c 'set -o pipefail; gradle --no-daemon connectedDebugAndroidTest 2>&1 | tee -a test.log'
+
+      # 結果を読めるよう、ログと結果を test-log ブランチに置く
+      - name: 試験のログを test-log ブランチへ
+        if: always()
+        run: |
+          mkdir -p /tmp/tl
+          cp test.log /tmp/tl/ 2>/dev/null || true
+          cp -r app/build/outputs/androidTest-results /tmp/tl/results 2>/dev/null || true
+          cp -r app/build/reports/androidTests /tmp/tl/reports 2>/dev/null || true
+          cd /tmp/tl
+          git init -q -b test-log
+          git add -A
+          git -c user.name=ci -c user.email=ci@users.noreply.github.com commit -qm "test log ${{ github.run_number }}" || true
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" test-log || true

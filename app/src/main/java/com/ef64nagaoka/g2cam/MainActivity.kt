@@ -18,6 +18,8 @@ import android.view.ViewGroup
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.LinearLayout
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.core.content.ContextCompat
@@ -174,6 +176,51 @@ class MainActivity : Activity() {
             }
         })
 
+        // ── 遡り録画（G2 録画用。既定はオフ） ──
+        root.addView(TextView(this).apply {
+            text = "遡り録画（G2 録画用）"
+            textSize = 16f
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, dp(16), 0, dp(4))
+        })
+        root.addView(CheckBox(this).apply {
+            text = "遡り録画を使う：G2 録画で録画を始めたとき、その直前の数秒も 1 本の動画に入れる。" +
+                "G2 録画を開いている間はカメラ（音声ありならマイクも）で録り続けるので、電池の減りと発熱が増えます"
+            isChecked = Prefs.preRoll(this@MainActivity)
+            setOnCheckedChangeListener { _, checked ->
+                Prefs.setPreRoll(this@MainActivity, checked)
+                notifyPreRollChanged()
+            }
+        })
+        root.addView(TextView(this).apply {
+            text = "遡る長さ"
+            setPadding(0, dp(4), 0, 0)
+        })
+        val secGroup = RadioGroup(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val nowSec = Prefs.preRollSeconds(this)
+        for (sec in intArrayOf(5, 10, 15, 30)) {
+            val b = RadioButton(this).apply {
+                id = View.generateViewId()
+                text = "$sec 秒"
+            }
+            secGroup.addView(b)
+            if (sec == nowSec) secGroup.check(b.id)
+            b.setOnCheckedChangeListener { _, checked ->
+                if (checked) {
+                    Prefs.setPreRollSeconds(this@MainActivity, sec)
+                    notifyPreRollChanged()
+                }
+            }
+        }
+        root.addView(secGroup)
+        root.addView(TextView(this).apply {
+            text = "・録画を止めたあと、直前の分をつないで 1 本に書き出します（再エンコードなし。長い録画ほど数十秒かかります）。" +
+                "書き出し中も G2 録画はそのまま使えます\n" +
+                "・スマホが熱いとき・空き容量が少ないときは、録りためを自動で休みます"
+            textSize = 13f
+            setPadding(0, dp(2), 0, dp(8))
+        })
+
         root.addView(CheckBox(this).apply {
             text = "G2 カメラが終了したら自動で停止する（終了の合図、または 2 分間応答がないとき）"
             isChecked = Prefs.autoStop(this@MainActivity)
@@ -185,7 +232,8 @@ class MainActivity : Activity() {
                 "・G2 カメラを開くと自動でカメラを始めるには、上の「待機モード」をオンにして「他のアプリの上に表示」を許可してください（G2 カメラを終了すると自動で止まります）。\n" +
                 "・起動しないときは、このアプリを開いて「カメラを開始」を押してから G2 カメラを開いてください（この画面を出したまま押すこと。Android の制約で、裏からは開始できません）。\n" +
                 "・画面を消しても通知が出ている間は動きます。手で止めるときは「停止」\n" +
-                "・録画は G2 カメラのメニュー「動画 録画/停止」から。写真も動画も、上で選んだ保存先にすぐ保存されます（選ばなければ「写真」アプリの G2Camera フォルダ。音声はマイクの許可があるときだけ）\n\n" +
+                "・録画は G2 カメラのメニュー「動画 録画/停止」、または G2 録画アプリのタップで。写真も動画も、上で選んだ保存先にすぐ保存されます（選ばなければ「写真」アプリの G2Camera フォルダ。音声はマイクの許可があるときだけ）\n" +
+                "・G2 録画を開くと、待機中から録画できる組み方にしておくので、タップしてすぐ録画が始まります。スマホが熱すぎるとき・空き容量が少ないときは、保存してから自動で止めます\n\n" +
                 "vivo / OriginOS など：「電池の最適化から除外」に加えて、アプリ情報の電池設定で「バックグラウンドでの高消費電力を許可」をオンにしてください。止まるときは最近のタスクでこのアプリを鍵（ロック）してください。"
             setPadding(0, dp(16), 0, 0)
             gravity = Gravity.START
@@ -193,6 +241,14 @@ class MainActivity : Activity() {
         })
 
         setContentView(ScrollView(this).apply { addView(root) })
+    }
+
+    /** 動いているサービスに遡り録画の設定が変わったことを伝える（止まっていれば次の開始時に読む） */
+    private fun notifyPreRollChanged() {
+        if (CameraService.running) {
+            startService(Intent(this, CameraService::class.java).setAction(CameraService.ACTION_PREROLL_CHANGED))
+        }
+        handler.postDelayed({ render() }, 300)
     }
 
     private fun onToggle() {
@@ -241,7 +297,14 @@ class MainActivity : Activity() {
         if (CameraService.running) {
             lines.add("配信したフレーム：${CameraService.framesServed}　撮影した枚数：${CameraService.photosTaken}")
             CameraService.recordingLabel?.let { lines.add("● 録画中 $it") }
+            CameraService.monitorLabel?.let { lines.add("スマホ：$it") }
         }
+        lines.add(
+            "遡り録画：" + (
+                CameraService.preRollText()
+                    ?: if (Prefs.preRoll(this)) "オン（${Prefs.preRollSeconds(this)} 秒）・G2 録画を開くと録りためを始めます" else "オフ"
+                ),
+        )
         lines.add("カメラ権限：" + if (camera) "OK" else "未許可")
         lines.add("録画の音声（マイク）：" + if (mic) "OK" else "未許可（無音で録画。許可はアプリ情報から）")
         lines.add("電池の最適化の除外：" + if (battery) "OK" else "未設定（推奨）")
