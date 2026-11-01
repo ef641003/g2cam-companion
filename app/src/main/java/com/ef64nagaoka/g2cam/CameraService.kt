@@ -748,9 +748,13 @@ class CameraService : LifecycleService(), CameraController {
         else -> 480
     }
 
-    /** 束ねた録画の実際の解像度（分からなければ null） */
+    /**
+     * 束ねた録画の実際の解像度（分からなければ null）。
+     * CameraX 1.3 の VideoCapture には resolutionInfo が無いので、束ねた面の解像度を読む（ライブラリ内向けの API）
+     */
+    @android.annotation.SuppressLint("RestrictedApi")
     private fun videoSize(vc: VideoCapture<Recorder>): Size? = try {
-        vc.resolutionInfo?.resolution
+        vc.attachedSurfaceResolution
     } catch (e: Exception) {
         null
     }
