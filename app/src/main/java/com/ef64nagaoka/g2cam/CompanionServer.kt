@@ -23,6 +23,8 @@ class RecordingState(
     val live: Boolean,
     /** 録画中も静止画を撮れるか */
     val capture: Boolean,
+    /** 実際に録っている解像度（例 3840x2160。分からなければ空） */
+    val resolution: String = "",
 ) {
     @Volatile var durationMs = 0L
     @Volatile var bytes = 0L
@@ -39,6 +41,8 @@ class RecordResult(
     val thumbnail: ByteArray?,
     /** 保存できたが警告があるとき・保存できなかったときの説明 */
     val error: String?,
+    /** 録った解像度（例 3840x2160。分からなければ空） */
+    val resolution: String = "",
 )
 
 /** サーバーがカメラ側に求める操作。CameraService が実装する。 */
@@ -82,8 +86,11 @@ interface CameraController {
     val diag: String
     /** 録画中の状態。録画していなければ null */
     val recording: RecordingState?
-    /** 録画を始める（ブロッキング。始まるまで待つ）。すでに録画中ならその状態を返す */
-    fun startRecording(audio: Boolean, quality: String, maxMs: Long): RecordingState
+    /**
+     * 録画を始める（ブロッキング。始まるまで待つ）。すでに録画中ならその状態を返す。
+     * still が false なら録画中の静止画を諦めて、そのぶん高い解像度（4K など）を通しやすくする（G2 録画）
+     */
+    fun startRecording(audio: Boolean, quality: String, maxMs: Long, still: Boolean): RecordingState
     /** 録画を止めて保存する（ブロッキング）。録画していなければ null */
     fun stopRecording(): RecordResult?
     /** 向こう側の都合（最長時間・通知）で止まった録画の結果。一度返したら消える */
@@ -174,7 +181,8 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
                 val audio = body.optBoolean("audio", true)
                 val quality = body.optString("quality", "fhd")
                 val maxMs = body.optLong("maxMs", 0L)
-                camera.startRecording(audio, quality, maxMs)
+                val still = body.optBoolean("still", true)
+                camera.startRecording(audio, quality, maxMs, still)
                 json(Response.Status.OK, statusJson())
             }
 
@@ -191,6 +199,7 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
                     .put("audio", r.audio)
                     .put("uri", r.uri?.toString() ?: JSONObject.NULL)
                     .put("error", r.error ?: JSONObject.NULL)
+                    .put("resolution", r.resolution)
                 r.thumbnail?.let { j.put("thumbnailBase64", Base64.encodeToString(it, Base64.NO_WRAP)) }
                 json(Response.Status.OK, j)
             }
@@ -243,6 +252,7 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
                         .put("recordAudio", r.audio)
                         .put("recordLive", r.live)
                         .put("recordCapture", r.capture)
+                        .put("recordResolution", r.resolution)
                 }
             }
 

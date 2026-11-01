@@ -157,10 +157,14 @@ class CameraService : LifecycleService(), CameraController {
     @Volatile private var extensionLabel = "なし"
     @Volatile private var bindNotes = ""
     @Volatile private var stabLabel = "なし"
+    /** 録画の束ね方（startRecording が候補を試すたびに決める）。静止画も束ねるか・電子式手ブレ補正のモード（null = 自動で選ぶ） */
+    @Volatile private var recordWithStill = true
+    @Volatile private var recordEisMode: Int? = null
+    @Volatile private var recordResLabel = "－"
     override val diag: String
         get() = buildDiag()
 
-    private fun buildDiag(): String = "構成=$boundLabel・静止画の拡張=$extensionLabel・手ブレ補正=$stabLabel・保存先=${Storage.describe(this)}" +
+    private fun buildDiag(): String = "構成=$boundLabel・静止画の拡張=$extensionLabel・手ブレ補正=$stabLabel・録画の解像度=$recordResLabel・保存先=${Storage.describe(this)}" +
             (if (bindNotes.isNotEmpty()) "・束ね直しの失敗=$bindNotes" else "")
     /** このサービスで録画したファイル（名前 → URI）。/file で返すときに使う */
     private val recentFiles = HashMap<String, Uri>()
@@ -500,7 +504,7 @@ class CameraService : LifecycleService(), CameraController {
                 }
             }
             // 録画中は、配信も録画と同じモードで安定化する（束ねたカメラ全体で 1 つのモードに揃える）
-            val eisMode = if (stabilize) chooseEisMode() else null
+            val eisMode = if (stabilize) (recordEisMode ?: chooseEisMode()) else null
             if (eisMode != null) {
                 try {
                     Camera2Interop.Extender(analysisBuilder)
@@ -531,11 +535,15 @@ class CameraService : LifecycleService(), CameraController {
 
             val base = if (facingValue == "user") CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
             val attempts = ArrayList<Attempt>()
-            if (video != null) {
+            if (video != null && recordWithStill) {
                 val cap = buildCapture(recording = true, withInterop = false)
                 attempts.add(Attempt(base, listOf(analysis, video, cap), "配信+録画+撮影", "なし"))
                 attempts.add(Attempt(base, listOf(analysis, video), "配信+録画", "なし"))
                 attempts.add(Attempt(base, listOf(video, cap), "録画+撮影", "なし"))
+                attempts.add(Attempt(base, listOf(video), "録画のみ", "なし"))
+            } else if (video != null) {
+                // 静止画を束ねない（G2 録画）。カメラの同時出力が 2 本で済むので、高い解像度が通りやすい
+                attempts.add(Attempt(base, listOf(analysis, video), "配信+録画", "なし"))
                 attempts.add(Attempt(base, listOf(video), "録画のみ", "なし"))
             } else {
                 extensionSelector(ext, base)?.let { (sel, label) ->
@@ -732,26 +740,76 @@ class CameraService : LifecycleService(), CameraController {
         else -> Quality.FHD
     }
 
-    override fun startRecording(audio: Boolean, quality: String, maxMs: Long): RecordingState = synchronized(recordLock) {
+    /** 画質の名前 → 短辺の画素数（頼んだ画質が通ったかの判定用） */
+    private fun shortSideOf(q: Quality): Int = when (q) {
+        Quality.UHD -> 2160
+        Quality.FHD -> 1080
+        Quality.HD -> 720
+        else -> 480
+    }
+
+    /** 束ねた録画の実際の解像度（分からなければ null） */
+    private fun videoSize(vc: VideoCapture<Recorder>): Size? = try {
+        vc.resolutionInfo?.resolution
+    } catch (e: Exception) {
+        null
+    }
+
+    override fun startRecording(audio: Boolean, quality: String, maxMs: Long, still: Boolean): RecordingState = synchronized(recordLock) {
         recordingState?.let { return it }
         if (camera == null) throw IllegalStateException("カメラが起動していません")
 
         // 録画の間は VideoCapture を加えて束ね直す（サムネイルは束ね直す前の最新フレーム）
         recordingThumb = latestFrame?.bytes
+        val want = qualityOf(quality)
+        val wantShort = shortSideOf(want)
         fun newRecorder() = Recorder.Builder()
             .setExecutor(recorderExecutor)
-            .setQualitySelector(QualitySelector.from(qualityOf(quality), FallbackStrategy.lowerQualityOrHigherThan(Quality.SD)))
+            .setQualitySelector(QualitySelector.from(want, FallbackStrategy.lowerQualityOrHigherThan(Quality.SD)))
             .build()
-        // 手ブレ補正つきで束ねてみて、端末が受け付けなければ補正なしでやり直す
+        // 束ね方の候補（静止画を束ねるか, 手ブレ補正のモード 0=なし）。頼んだ画質が通るまで順に試し、通らなければ一番高かったものを使う。
+        // 静止画も束ねると同時出力が 3 本になり、プレビュー安定化（2）は解像度の上限が低いので、どちらも画質が下がる原因になる
         val wantStab = Prefs.stabilization(this)
-        rebindAndWait(newRecorder(), wantStab)
-        var vc = videoCapture
-        if (vc == null && wantStab) {
-            val why = lastError ?: bindNotes
-            Log.w(TAG, "動画の手ブレ補正つきでは束ねられません。補正なしでやり直します: $why")
-            rebindAndWait(newRecorder(), false)
-            vc = videoCapture
+        val modes = availableStabModes()
+        val eis0 = if (wantStab) (chooseEisMode() ?: 0) else 0
+        val plans = ArrayList<Pair<Boolean, Int>>()
+        fun add(s: Boolean, e: Int) { if (plans.none { it.first == s && it.second == e }) plans.add(s to e) }
+        add(still, eis0)
+        if (eis0 == 2 && modes.contains(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)) add(still, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)
+        add(still, 0)
+        var best: Triple<Pair<Boolean, Int>, Int, String>? = null
+        var lastBound: Pair<Boolean, Int>? = null
+        val tried = ArrayList<String>()
+        for (p in plans) {
+            recordWithStill = p.first
+            recordEisMode = p.second
+            rebindAndWait(newRecorder(), p.second != 0)
+            val v = videoCapture
+            if (v == null) {
+                tried.add("${if (p.first) "撮影あり" else "撮影なし"}・補正${p.second}=束ねられない")
+                continue
+            }
+            lastBound = p
+            val size = videoSize(v)
+            val short = size?.let { minOf(it.width, it.height) } ?: 0
+            val label = size?.let { "${maxOf(it.width, it.height)}x${minOf(it.width, it.height)}" } ?: "不明"
+            tried.add("${if (p.first) "撮影あり" else "撮影なし"}・補正${p.second}=$label")
+            if (best == null || short > best.second) best = Triple(p, short, label)
+            if (short >= wantShort || size == null) break
         }
+        Log.i(TAG, "録画の束ね方（頼んだ短辺 $wantShort）: ${tried.joinToString(" / ")}")
+        val chosen = best
+        if (chosen != null && chosen.first != lastBound) {
+            recordWithStill = chosen.first.first
+            recordEisMode = chosen.first.second
+            rebindAndWait(newRecorder(), chosen.first.second != 0)
+        }
+        recordWithStill = true
+        recordEisMode = null
+        val vc = videoCapture
+        val resolution = vc?.let { v -> videoSize(v)?.let { "${maxOf(it.width, it.height)}x${minOf(it.width, it.height)}" } } ?: ""
+        recordResLabel = if (resolution.isNotEmpty()) "$resolution（頼んだ画質 $quality。試した束ね方: ${tried.joinToString(" / ")}）" else "不明"
+        diagText = buildDiag()
         if (vc == null) {
             // 録画できる組み合わせが無かった。理由を控えてから、元の配信＋撮影に戻す
             val reason = lastError ?: "この端末では録画を開始できません"
@@ -801,6 +859,7 @@ class CameraService : LifecycleService(), CameraController {
             audio = withAudio,
             live = imageAnalysis != null,
             capture = imageCapture != null,
+            resolution = resolution,
         )
         val started = CountDownLatch(1)
         finalizeEvent = null
@@ -852,7 +911,7 @@ class CameraService : LifecycleService(), CameraController {
             recordLimitTimer = timer
             mainHandler.postDelayed(timer, maxMs)
         }
-        Log.i(TAG, "録画開始 $name（音声 $withAudio・配信 ${state.live}・撮影 ${state.capture}）")
+        Log.i(TAG, "録画開始 $name（音声 $withAudio・配信 ${state.live}・撮影 ${state.capture}・解像度 $resolution）")
         return state
     }
 
@@ -906,6 +965,7 @@ class CameraService : LifecycleService(), CameraController {
             audio = state?.audio ?: false,
             thumbnail = recordingThumb,
             error = error,
+            resolution = state?.resolution ?: "",
         )
         recordingThumb = null
         updateNotification(null)
