@@ -117,6 +117,8 @@ class CameraService : LifecycleService(), CameraController {
         /** 画面表示用：電池・温度・空き容量（5 秒ごとに更新） */
         @Volatile var monitorLabel: String? = null
         @Volatile private var instance: CameraService? = null
+        /** 書き出し中の名前（プロセス全体。サービスを作り直したときの書き出し直しで重ねないため） */
+        private val activeMerges: MutableSet<String> = java.util.Collections.synchronizedSet(HashSet())
 
         /** 画面表示用：遡り録画の状態（サービスが動いていなければ null） */
         fun preRollText(): String? = instance?.describePreRoll()
@@ -201,6 +203,8 @@ class CameraService : LifecycleService(), CameraController {
         @Volatile var bytes = 0L
         @Volatile var finalizeEvent: VideoRecordEvent.Finalize? = null
         @Volatile var startFailure: String? = null
+        /** 録り始めたときの動画の向き（つなぐ材料の向きが揃っているかを見る） */
+        @Volatile var rotation = Surface.ROTATION_0
         /** 本番の録画に使っているとき、そのタップの時刻（経過表示用。0 なら録りためのまま） */
         @Volatile var sessionTapAt = 0L
         val isFinalized: Boolean get() = finalized.count == 0L
@@ -270,8 +274,8 @@ class CameraService : LifecycleService(), CameraController {
     override val mergingCount: Int get() = merging.size
     @Volatile private var mergeNote: String? = null
     override val lastMergeNote: String? get() = mergeNote
-    /** G2 カメラ側がまだ受け取っていない録画結果（最長時間・通知・高温などで止めたとき） */
-    @Volatile private var pendingResult: RecordResult? = null
+    /** G2 カメラ側がまだ受け取っていない録画結果（最長時間・通知・高温などで止めたとき）。取り出しは一度だけ */
+    private val pendingResult = java.util.concurrent.atomic.AtomicReference<RecordResult?>(null)
     /** 区切り録画で書き終えて、まだ渡していない分 */
     private val completedSegments = ArrayDeque<RecordResult>()
     override val pendingSegments: Int get() = synchronized(segmentLock) { completedSegments.size }
@@ -301,6 +305,10 @@ class CameraService : LifecycleService(), CameraController {
     }
 
     // G2 カメラ側とのつながり（終了に合わせた自動停止）
+    /** 止めようとしている（遡り録画の書き出しが済むのを待っている間も） */
+    @Volatile private var stopping = false
+    /** G2 アプリの終了・応答の途絶えによる停止（止まるまでに G2 アプリが戻ってきたら取りやめる）。通知の「停止」は取りやめない */
+    @Volatile private var stopCancellable = false
     /** 録画中に G2 カメラが終了した。録画が終わったらサービスを止める */
     @Volatile private var stopWhenRecordingEnds = false
     @Volatile private var lastClientAt = 0L
@@ -309,9 +317,9 @@ class CameraService : LifecycleService(), CameraController {
         override fun run() {
             val idle = SystemClock.elapsedRealtime() - lastClientAt
             // 録画中・書き出し中は、メガネ・G2 カメラとの接続が切れても止めない（済んでから判断する）
-            if (session == null && merging.isEmpty() && clientSeen && idle > IDLE_STOP_MS && Prefs.autoStop(this@CameraService)) {
+            if (session == null && merging.isEmpty() && !stopping && clientSeen && idle > IDLE_STOP_MS && Prefs.autoStop(this@CameraService)) {
                 Log.i(TAG, "G2 カメラからの応答が ${idle / 1000} 秒途絶えたので停止します")
-                shutdownGracefully()
+                shutdownGracefully(cancellable = true)
                 return
             }
             // G2 録画が閉じられたまま：準備（遡り録画の録りため）を解いて電池を守る
@@ -360,7 +368,7 @@ class CameraService : LifecycleService(), CameraController {
         super.onStartCommand(intent, flags, startId)
         when (intent?.action) {
             ACTION_STOP -> {
-                shutdownGracefully()
+                shutdownGracefully(cancellable = false)
                 return START_NOT_STICKY
             }
             ACTION_STOP_RECORDING -> {
@@ -388,12 +396,20 @@ class CameraService : LifecycleService(), CameraController {
                 return START_NOT_STICKY
             }
         }
+        if (running && stopping) {
+            // 止めている途中（書き出し待ち）に本体の画面から開始された：停止を取りやめてカメラを戻す
+            stopping = false
+            Log.i(TAG, "開始を頼まれたので停止を取りやめます")
+            if (camera == null) bindCamera(null, null)
+            refreshNotification()
+        }
         if (!running) {
             if (!startInForeground()) {
                 stopSelf()
                 return START_NOT_STICKY
             }
             running = true
+            stopping = false
             instance = this
             lastError = null
             framesServed = 0
@@ -435,31 +451,82 @@ class CameraService : LifecycleService(), CameraController {
         mergeExecutor.shutdown()
     }
 
-    /** 録画中なら保存してから止める。G2 カメラの終了・通知の「停止」・応答の途絶えから呼ばれる */
-    private fun shutdownGracefully() {
+    /**
+     * 止める。録画中なら保存してから、遡り録画の書き出しが残っていれば済んでから止まる（書き出しを待つ間も、ほかの仕事は止めない）。
+     * cancellable：G2 アプリの終了・応答の途絶えによる停止。止まるまでに G2 アプリが戻ってきたら（映像・準備・録画の要求）取りやめる。
+     * 通知の「停止」は取りやめず、書き出しを待つ間はカメラを手放す
+     */
+    private fun shutdownGracefully(cancellable: Boolean) {
+        if (stopping && !stopCancellable) return // 確定した停止の途中
+        stopping = true
+        stopCancellable = cancellable
         if (session == null && bufCur == null && merging.isEmpty()) {
             stopSelf()
             return
         }
         postWork {
-            try {
-                synchronized(recordLock) {
-                    stopWhenRecordingEnds = false
-                    armed = null
-                    pendingArm = null
-                    stopSessionLocked(null, rebind = false)?.let { pendingResult = it }
-                    stopBufferLocked()
+            synchronized(recordLock) {
+                if (!stopping) return@postWork // 取りやめになった
+                stopWhenRecordingEnds = false
+                armed = null
+                pendingArm = null
+                try {
+                    stopSessionLocked(null, rebind = false)?.let { pendingResult.set(it) }
+                } catch (e: Exception) {
+                    Log.w(TAG, "stop recording (shutdown) failed", e)
                 }
-                if (merging.isNotEmpty()) {
-                    Log.i(TAG, "書き出しが済むのを待ってから止めます（${merging.size} 本）")
-                    refreshNotification()
-                    waitMerges(10 * 60_000L)
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "shutdown failed", e)
-            } finally {
-                mainHandler.post { stopSelf() }
+                stopBufferLocked()
             }
+            if (merging.isEmpty()) {
+                mainHandler.post { finishStop() }
+                return@postWork
+            }
+            Log.i(TAG, "書き出しが済むのを待ってから止めます（${merging.size} 本）")
+            if (!cancellable) releaseCamera()
+            refreshNotification()
+            // 書き出しの順番待ちの最後に置く（それより前に頼んだ書き出しが全部済んでから止まる）
+            try {
+                mergeExecutor.execute { mainHandler.post { finishStop() } }
+            } catch (e: RejectedExecutionException) {
+                mainHandler.post { finishStop() }
+            }
+        }
+    }
+
+    private fun finishStop() {
+        if (!stopping) {
+            Log.i(TAG, "停止を取りやめました")
+            return
+        }
+        if (session != null) return // 念のため：録画が始まっていたら止めない
+        stopSelf()
+    }
+
+    /** G2 アプリが戻ってきた：自動の停止なら取りやめて true。通知の「停止」の途中なら false */
+    private fun cancelStop(why: String): Boolean {
+        if (!stopping) return true
+        if (!stopCancellable) return false
+        stopping = false
+        Log.i(TAG, "G2 アプリが戻ってきたので停止を取りやめます（$why）")
+        if (camera == null) mainHandler.post { if (camera == null && running) bindCamera(null, null) }
+        refreshNotification()
+        return true
+    }
+
+    /** カメラを手放す（通知の「停止」のあと、書き出しが済むのを待つ間） */
+    private fun releaseCamera() {
+        mainHandler.post {
+            try {
+                ProcessCameraProvider.getInstance(this).get().unbindAll()
+            } catch (e: Exception) {
+                Log.w(TAG, "unbind failed", e)
+            }
+            camera = null
+            imageAnalysis = null
+            imageCapture = null
+            videoCapture = null
+            frameLock.withLock { latestFrame = null }
+            boundLabel = "停止中（書き出し待ち）"
         }
     }
 
@@ -495,6 +562,7 @@ class CameraService : LifecycleService(), CameraController {
 
     /** 通知と本体画面の表示を、いまの状態に合わせる */
     private fun refreshNotification() {
+        if (!running) return
         val s = session
         val main = when {
             s != null -> "録画中（${if (s.audio) "音声あり" else "無音"}${if (s.segment > 1) "・${s.segment} 本目" else ""}）"
@@ -502,7 +570,7 @@ class CameraService : LifecycleService(), CameraController {
             armed != null -> "録画の準備ができています"
             else -> null
         }
-        val merge = if (merging.isNotEmpty()) "動画を書き出し中（${merging.size} 本）" else null
+        val merge = if (merging.isNotEmpty()) "動画を書き出し中（${merging.size} 本${if (stopping) "。済んだら止まります" else ""}）" else null
         val text = listOfNotNull(main, merge).joinToString("・").ifEmpty { null }
         val key = "$text|${s != null}"
         if (key == lastNotificationText) return
@@ -896,8 +964,9 @@ class CameraService : LifecycleService(), CameraController {
                 val f = latestFrame
                 if (f != null && f.seq > afterSeq) {
                     framesServed++
-                    // 映像を取りに来ている = G2 カメラがまた動いている。録画後の自動停止は取り消す
+                    // 映像を取りに来ている = G2 カメラがまた動いている。録画後の自動停止・書き出し待ちの停止は取り消す
                     stopWhenRecordingEnds = false
+                    if (stopping) cancelStop("映像")
                     return f
                 }
                 if (remainNs <= 0L) return null
@@ -919,8 +988,8 @@ class CameraService : LifecycleService(), CameraController {
             stopWhenRecordingEnds = true
             return true
         }
-        // 返事を返し終えてから止める（書き出し中なら済んでから）
-        mainHandler.postDelayed({ shutdownGracefully() }, 300)
+        // 返事を返し終えてから止める（書き出し中なら済んでから。それまでに G2 アプリが戻ってきたら取りやめ）
+        mainHandler.postDelayed({ shutdownGracefully(cancellable = true) }, 300)
         return true
     }
 
@@ -963,10 +1032,20 @@ class CameraService : LifecycleService(), CameraController {
     }
 
     override fun capture(): ByteArray = synchronized(captureLock) {
-        if (imageCapture == null && session == null && armed != null) {
-            // G2 録画の準備（静止画を束ねない組み方）のまま撮影を頼まれた：準備を解いて撮影できる組み方に戻す
+        if (imageCapture == null && session == null && (armed != null || videoCapture != null)) {
+            // G2 録画の準備（静止画を束ねない組み方）のまま、または束ね直しが遅れて録画の組み方のまま撮影を頼まれた：撮影できる組み方に戻す
             synchronized(recordLock) {
-                if (session == null && armed != null) disarmLocked()
+                if (session == null && imageCapture == null) {
+                    if (armed != null) {
+                        disarmLocked()
+                    } else if (videoCapture != null && running) {
+                        try {
+                            rebindAndWait(null)
+                        } catch (e: Exception) {
+                            Log.w(TAG, "rebind for capture failed", e)
+                        }
+                    }
+                }
             }
         }
         val cap = imageCapture
@@ -1119,7 +1198,23 @@ class CameraService : LifecycleService(), CameraController {
     }
 
     // ── 録画：1 本ずつの録り始め・保存 ──
-    private fun newVideoName(): String = "G2_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".mp4"
+    private var lastNameBase = ""
+    private var lastNameCount = 0
+
+    /** 保存名。同じ秒に 2 本目ができたら _2 を付け、書き出し中・保存済み・書き出しの段取りと重ならないようにする（recordLock の中で） */
+    private fun newVideoName(): String {
+        val base = "G2_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        if (base == lastNameBase) lastNameCount += 1 else {
+            lastNameBase = base
+            lastNameCount = 1
+        }
+        var name = if (lastNameCount == 1) "$base.mp4" else "${base}_$lastNameCount.mp4"
+        while (merging.containsKey(name) || recentFiles.containsKey(name) || manifestFor(name).exists()) {
+            lastNameCount += 1
+            name = "${base}_$lastNameCount.mp4"
+        }
+        return name
+    }
 
     /** 保存先：選んだフォルダがあればそこへ直接、無ければ写真アプリ（DCIM/G2Camera） */
     private fun newDestinationRec(name: String, audio: Boolean): Rec = Rec(name, audio, null, Storage.openVideoInTree(this, name))
@@ -1138,11 +1233,12 @@ class CameraService : LifecycleService(), CameraController {
      * 前の 1 本を stop した直後に呼んでもよい（前の保存が済みしだい始まる）。失敗したら作りかけを消して例外を投げる
      */
     @android.annotation.SuppressLint("MissingPermission")
-    private fun startRecLocked(vc: VideoCapture<Recorder>, rec: Rec) {
+    private fun startRecLocked(vc: VideoCapture<Recorder>, rec: Rec, startTimeoutSec: Long = 8) {
         check(Looper.myLooper() != Looper.getMainLooper()) { "main thread" }
         // 動画の向きは 1 本ごとに、始める時点の端末の向きに合わせる
         val r = rotation
         if (vc.targetRotation != r) onMainAndWait { vc.targetRotation = r }
+        rec.rotation = r
         val pending: PendingRecording = try {
             when {
                 rec.file != null -> vc.output.prepareRecording(this, FileOutputOptions.Builder(rec.file).build())
@@ -1181,7 +1277,7 @@ class CameraService : LifecycleService(), CameraController {
             cleanupRec(rec)
             throw IllegalStateException("録画を始められません: ${e.message}")
         }
-        if (!rec.started.await(8, TimeUnit.SECONDS)) {
+        if (!rec.started.await(startTimeoutSec, TimeUnit.SECONDS)) {
             rec.stopAt = SystemClock.elapsedRealtime()
             try {
                 rec.recording?.close()
@@ -1241,7 +1337,7 @@ class CameraService : LifecycleService(), CameraController {
             val s = session
             if (s != null && s.current === rec) {
                 Log.w(TAG, "$why ${ev.cause?.message ?: ""}")
-                stopSessionLocked(why, rebind = true)?.let { pendingResult = it }
+                stopSessionLocked(why, rebind = true)?.let { pendingResult.set(it) }
                 return
             }
             if (bufCur === rec) {
@@ -1285,6 +1381,7 @@ class CameraService : LifecycleService(), CameraController {
                 return
             }
             if (!running) throw IllegalStateException("カメラが起動していません")
+            if (!cancelStop("録画の準備")) throw IllegalStateException("コンパニオンを止めています（動画の書き出しが済むと止まります）")
             val req = ArmRequest(quality, audio, still, stopTempC)
             if (session != null) {
                 // 録画中：録画が終わってから準備し直す
@@ -1343,7 +1440,7 @@ class CameraService : LifecycleService(), CameraController {
     /** 遡り録画がオンで、準備ができていて、録画していなければ録りためを始める（recordLock の中で） */
     private fun maybeStartBufferLocked() {
         val a = armed ?: return
-        if (!running || !Prefs.preRoll(this) || session != null || bufCur != null || bufPaused != null || stopWhenRecordingEnds) return
+        if (!running || stopping || !Prefs.preRoll(this) || session != null || bufCur != null || bufPaused != null || stopWhenRecordingEnds) return
         if (a.facing != facingValue) return
         val vc = videoCapture ?: return
         val now = SystemClock.elapsedRealtime()
@@ -1366,7 +1463,9 @@ class CameraService : LifecycleService(), CameraController {
 
     private fun scheduleBufferRollLocked() {
         bufTimer?.let { mainHandler.removeCallbacks(it) }
-        val r = Runnable { postWork { synchronized(recordLock) { rollBufferLocked() } } }
+        // 発火が遅れて別の切れ端の番になっていたら回さない（古いタイマーが新しい切れ端を早回しするのを防ぐ）
+        val target = bufCur
+        val r = Runnable { postWork { synchronized(recordLock) { if (bufCur === target) rollBufferLocked() } } }
         bufTimer = r
         mainHandler.postDelayed(r, chunkMs())
     }
@@ -1376,6 +1475,7 @@ class CameraService : LifecycleService(), CameraController {
         val old = bufCur ?: return
         if (session != null) return
         val vc = videoCapture ?: return
+        bufTimer?.let { mainHandler.removeCallbacks(it) }
         bufTimer = null
         val next = newChunkRec(old.audio)
         old.stopAt = SystemClock.elapsedRealtime()
@@ -1386,7 +1486,8 @@ class CameraService : LifecycleService(), CameraController {
         }
         var startedNext = true
         try {
-            startRecLocked(vc, next)
+            // 次は前の切れ端の保存が済んでから始まるので、長めに待つ
+            startRecLocked(vc, next, 30)
         } catch (e: Exception) {
             startedNext = false
             bufError = e.message ?: e.javaClass.simpleName
@@ -1421,7 +1522,7 @@ class CameraService : LifecycleService(), CameraController {
     private fun readyMsNow(wantMs: Long): Long {
         val cur = bufCur ?: return 0L
         if (cur.startedAt == 0L) return 0L
-        val prev = bufPrev?.takeIf { it.isFinalized && it.startFailure == null }
+        val prev = bufPrev?.takeIf { it.isFinalized && it.startFailure == null && it.rotation == cur.rotation }
         return PreRollPlan.plan(SystemClock.elapsedRealtime(), cur.startedAt, wantMs, prev?.let { PreRollPlan.Prev(it.durationMs, it.stopAt) }).preRollMs
     }
 
@@ -1478,7 +1579,8 @@ class CameraService : LifecycleService(), CameraController {
         val tapAt = SystemClock.elapsedRealtime()
         synchronized(recordLock) {
             session?.let { return snapshot(it) }
-            if (camera == null) throw IllegalStateException("カメラが起動していません")
+            if (!cancelStop("録画")) throw IllegalStateException("コンパニオンを止めています（動画の書き出しが済むと止まります）")
+            if (camera == null) throw IllegalStateException("カメラが起動していません（止める途中から戻ったところなら、少し待ってからもう一度）")
             val thumb = latestFrame?.bytes
             val withAudio = o.audio && audioPermitted
             var a = armed
@@ -1502,7 +1604,7 @@ class CameraService : LifecycleService(), CameraController {
                 // 遡り録画：いま録っている切れ端をそのまま本番にする（つなぎ目なし）。足りない分は一つ前の切れ端から
                 bufTimer?.let { mainHandler.removeCallbacks(it) }
                 bufTimer = null
-                val prev = bufPrev?.takeIf { it.isFinalized && it.startFailure == null && it.file?.exists() == true }
+                val prev = bufPrev?.takeIf { it.isFinalized && it.startFailure == null && it.file?.exists() == true && it.rotation == cur.rotation }
                 val plan = PreRollPlan.plan(
                     tapAt, cur.startedAt, Prefs.preRollSeconds(this) * 1000L,
                     prev?.let { PreRollPlan.Prev(it.durationMs, it.stopAt) },
@@ -1548,7 +1650,9 @@ class CameraService : LifecycleService(), CameraController {
         s.timer = null
         if (s.opts.maxMs <= 0) return
         val due = s.tapAt + s.opts.maxMs * s.segment
-        val r = Runnable { postWork { synchronized(recordLock) { onSegmentDueLocked(s) } } }
+        // 発火が遅れて、その間に（空き容量の都合などで）区切っていたら、この区切りはもう済んでいる
+        val seg = s.segment
+        val r = Runnable { postWork { synchronized(recordLock) { if (s.segment == seg) onSegmentDueLocked(s) } } }
         s.timer = r
         mainHandler.postDelayed(r, (due - SystemClock.elapsedRealtime()).coerceAtLeast(0L))
     }
@@ -1559,7 +1663,7 @@ class CameraService : LifecycleService(), CameraController {
             rollSegmentLocked(s, null)
         } else {
             Log.i(TAG, "録画を止めます（最長録画時間）")
-            stopSessionLocked(null, rebind = true)?.let { pendingResult = it }
+            stopSessionLocked(null, rebind = true)?.let { pendingResult.set(it) }
         }
     }
 
@@ -1568,20 +1672,22 @@ class CameraService : LifecycleService(), CameraController {
         if (session !== s) return
         val vc = videoCapture
         if (vc == null) {
-            stopSessionLocked(note, rebind = true)?.let { pendingResult = it }
+            stopSessionLocked(note, rebind = true)?.let { pendingResult.set(it) }
             return
         }
         val old = s.current
+        // 次のファイル（選んだフォルダなら書き込み先も）を先に作っておき、止めてから始めるまでの欠けを短くする
+        val next = newDestinationRec(newVideoName(), s.audio)
         old.stopAt = SystemClock.elapsedRealtime()
         try {
             old.recording?.stop()
         } catch (e: Exception) {
             Log.w(TAG, "stop failed", e)
         }
-        val next = newDestinationRec(newVideoName(), s.audio)
         var startError: String? = null
         try {
-            startRecLocked(vc, next)
+            // 次は前のファイルの保存が済んでから始まるので、長めに待つ
+            startRecLocked(vc, next, 30)
         } catch (e: Exception) {
             startError = e.message ?: e.javaClass.simpleName
         }
@@ -1594,7 +1700,7 @@ class CameraService : LifecycleService(), CameraController {
             s.timer = null
             session = null
             recordingLabel = null
-            pendingResult = r.copy(error = listOfNotNull(r.error, "区切りの続きを始められませんでした（$startError）").joinToString("。"))
+            pendingResult.set(r.copy(error = listOfNotNull(r.error, "区切りの続きを始められませんでした（$startError）").joinToString("。")))
             refreshNotification()
             afterSessionLocked(rebind = true)
             return
@@ -1626,12 +1732,15 @@ class CameraService : LifecycleService(), CameraController {
             val parts = ArrayList<Mp4Merger.Part>()
             pre.prev?.file?.let { parts.add(Mp4Merger.Part(it, pre.plan.prevFromMs * 1000L)) }
             parts.add(Mp4Merger.Part(file, pre.plan.curFromMs * 1000L))
-            if (rec.finalizeEvent != null && rec.bytes > 0L && file.length() > 0L) {
-                enqueueMerge(name, parts, dur * 1000L)
+            // 何も録れていないと分かったときだけ諦める。保存待ちが長引いているだけなら、書き出しの側で済むのを待つ
+            val nothing = rec.isFinalized && (rec.bytes <= 0L || !file.exists() || file.length() == 0L)
+            if (!nothing) {
+                enqueueMerge(name, parts, dur * 1000L, if (rec.isFinalized) null else rec.finalized)
+                val saveError = rec.finalizeEvent?.takeIf { it.hasError() }?.let { "保存時のエラー（${errorText(it.error)}）" }
                 return RecordResult(
                     name = name, uri = null, durationMs = dur, bytes = (rate * dur).toLong(), audio = s.audio,
-                    thumbnail = s.thumb, error = note, resolution = s.resolution, preRollMs = pre.plan.preRollMs,
-                    pending = true, segment = s.segment,
+                    thumbnail = s.thumb, error = listOfNotNull(note, saveError).joinToString("。").ifEmpty { null },
+                    resolution = s.resolution, preRollMs = pre.plan.preRollMs, pending = true, segment = s.segment,
                 )
             }
             parts.forEach { it.file.delete() }
@@ -1679,7 +1788,7 @@ class CameraService : LifecycleService(), CameraController {
             stopWhenRecordingEnds = false
             armed = null
             pendingArm = null
-            mainHandler.post { shutdownGracefully() }
+            mainHandler.post { shutdownGracefully(cancellable = true) }
             return
         }
         val req = pendingArm
@@ -1709,11 +1818,7 @@ class CameraService : LifecycleService(), CameraController {
 
     override fun stopRecording(): RecordResult? = synchronized(recordLock) { stopSessionLocked(null, rebind = true) }
 
-    override fun takePendingResult(): RecordResult? {
-        val r = pendingResult
-        pendingResult = null
-        return r
-    }
+    override fun takePendingResult(): RecordResult? = pendingResult.getAndSet(null)
 
     override fun takeSegments(): List<RecordResult> = synchronized(segmentLock) {
         val list = ArrayList(completedSegments)
@@ -1727,7 +1832,7 @@ class CameraService : LifecycleService(), CameraController {
             synchronized(recordLock) {
                 if (session == null) return
                 Log.i(TAG, "録画を止めます（$reason）")
-                stopSessionLocked(note, rebind = true)?.let { pendingResult = it }
+                stopSessionLocked(note, rebind = true)?.let { pendingResult.set(it) }
             }
         } catch (e: Exception) {
             Log.w(TAG, "stop recording ($reason) failed", e)
@@ -1756,6 +1861,8 @@ class CameraService : LifecycleService(), CameraController {
                 m.thermal >= PowerManager.THERMAL_STATUS_CRITICAL
             if (hot) {
                 stopRecordingInternally("高温", "スマホが熱くなったので録画を止めて保存しました（${if (m.tempC.isNaN()) "発熱 段階${m.thermal}" else "${fmt1(m.tempC)}度"}）")
+                // 録画のあとの録りため（このあとに順番待ち）も、冷えるまで休ませる
+                if (armed != null && Prefs.preRoll(this)) bufPaused = "heat"
                 return
             }
             if (m.freeBytes >= 0) {
@@ -1771,7 +1878,8 @@ class CameraService : LifecycleService(), CameraController {
                             rollSegmentLocked(s, "空き容量の都合で早めに区切りました")
                         } else {
                             Log.i(TAG, "録画を止めます（空き容量）")
-                            stopSessionLocked("空き容量が少なくなったので録画を止めて保存しました", rebind = true)?.let { pendingResult = it }
+                            stopSessionLocked("空き容量が少なくなったので録画を止めて保存しました", rebind = true)?.let { pendingResult.set(it) }
+                            if (armed != null && Prefs.preRoll(this)) bufPaused = "space"
                         }
                     }
                 }
@@ -1829,26 +1937,31 @@ class CameraService : LifecycleService(), CameraController {
         }
     }
 
-    private fun enqueueMerge(name: String, parts: List<Mp4Merger.Part>, expectUs: Long) {
+    /** つなぎ合わせを頼む。ready があれば、材料の保存（CameraX の書き終わり）を待ってから始める */
+    private fun enqueueMerge(name: String, parts: List<Mp4Merger.Part>, expectUs: Long, ready: CountDownLatch? = null) {
         writeManifest(name, parts, expectUs, null)
         val latch = CountDownLatch(1)
         merging[name] = latch
+        activeMerges.add(name)
         refreshNotification()
         try {
             mergeExecutor.execute {
                 try {
+                    if (ready != null && !ready.await(5, TimeUnit.MINUTES)) Log.w(TAG, "材料の保存が済まないまま書き出します: $name")
                     runMerge(name, parts, expectUs)
                 } catch (e: Throwable) {
                     Log.e(TAG, "merge crashed: $name", e)
                     mergeNote = "$name の書き出しに失敗しました（${e.message}）"
                 } finally {
-                    merging.remove(name)
+                    if (merging[name] === latch) merging.remove(name)
+                    activeMerges.remove(name)
                     latch.countDown()
                     mainHandler.post { refreshNotification() }
                 }
             }
         } catch (e: RejectedExecutionException) {
             merging.remove(name)
+            activeMerges.remove(name)
             latch.countDown()
         }
     }
@@ -1882,9 +1995,10 @@ class CameraService : LifecycleService(), CameraController {
             Log.w(TAG, "つなぎ合わせに失敗（$why）。材料をそのまま保存します")
             uri = Storage.copyVideo(this, parts.last().file, name)
             val preName = name.removeSuffix(".mp4") + "_pre.mp4"
-            if (uri != null && parts.size > 1) Storage.copyVideo(this, parts.first().file, preName)
+            val preSaved = uri != null && parts.size > 1 && Storage.copyVideo(this, parts.first().file, preName) != null
             note = if (uri != null) {
-                "$name：遡りをつなげませんでした（$why）" + (if (parts.size > 1) "。直前の分は $preName に保存しました" else "")
+                "$name：遡りをつなげませんでした（$why）" +
+                    (if (parts.size > 1) (if (preSaved) "。直前の分は $preName に保存しました" else "。直前の分は保存できませんでした") else "")
             } else {
                 "$name：書き出せませんでした（$why）。空き容量を確保してからコンパニオンを開き直すと、もう一度書き出します"
             }
@@ -1908,6 +2022,8 @@ class CameraService : LifecycleService(), CameraController {
             try {
                 val j = JSONObject(m.readText())
                 val name = j.getString("name")
+                // まだ書き出している（同じプロセスの前のサービスが頼んだ）ものは重ねない
+                if (activeMerges.contains(name)) continue
                 val arr = j.getJSONArray("parts")
                 val parts = (0 until arr.length()).map {
                     val p = arr.getJSONObject(it)
@@ -1944,17 +2060,11 @@ class CameraService : LifecycleService(), CameraController {
         }
     }
 
-    private fun waitMerges(timeoutMs: Long) {
-        val until = SystemClock.elapsedRealtime() + timeoutMs
-        while (merging.isNotEmpty() && SystemClock.elapsedRealtime() < until) {
-            merging.values.firstOrNull()?.await(1, TimeUnit.SECONDS)
-        }
-    }
-
     // ── 保存した動画を渡す ──
     override fun openRecording(name: String): Pair<InputStream, Long>? {
-        // 書き出し中なら済むまで待つ
-        merging[name]?.await(180, TimeUnit.SECONDS)
+        // 書き出し中なら済むまで待つ。待ちきれなければ「書き出し中」で断る（作りかけを渡さない）
+        val m = merging[name]
+        if (m != null && !m.await(180, TimeUnit.SECONDS)) throw BusyException("$name は書き出し中です。しばらくしてからもう一度取り寄せてください")
         var uri = recentFiles[name] ?: Storage.findInTree(this, name)
         var size = -1L
         if (uri == null) {

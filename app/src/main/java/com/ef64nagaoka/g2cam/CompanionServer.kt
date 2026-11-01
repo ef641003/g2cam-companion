@@ -14,6 +14,9 @@ import java.io.InputStream
 /** プレビュー用の 1 フレーム。seq は増えていく通し番号 */
 class Frame(val seq: Long, val bytes: ByteArray)
 
+/** いまは応じられない（書き出し中など）。503 で返し、G2 アプリにあとでやり直してもらう */
+class BusyException(message: String) : Exception(message)
+
 /** 録画中の状態（/status 用の写し） */
 class RecordingState(
     /** いま書いているファイルの名前 */
@@ -145,7 +148,7 @@ interface CameraController {
     fun takeSegments(): List<RecordResult>
     /** 区切り録画で書き終えて、まだ渡していない本数 */
     val pendingSegments: Int
-    /** 保存した動画を名前で開く（ストリームと大きさ）。書き出し中なら済むまで待つ。無ければ null */
+    /** 保存した動画を名前で開く（ストリームと大きさ）。書き出し中なら済むまで待ち、待ちきれなければ BusyException。無ければ null */
     fun openRecording(name: String): Pair<InputStream, Long>?
     /** 遡り録画の状態 */
     val preRollInfo: PreRollInfo
@@ -167,6 +170,8 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
         camera.touch()
         val res = try {
             route(session)
+        } catch (e: BusyException) {
+            json(Response.Status.SERVICE_UNAVAILABLE, JSONObject().put("ok", false).put("busy", true).put("error", e.message ?: "busy"))
         } catch (e: Exception) {
             json(Response.Status.INTERNAL_ERROR, JSONObject().put("ok", false).put("error", e.message ?: e.javaClass.simpleName))
         }

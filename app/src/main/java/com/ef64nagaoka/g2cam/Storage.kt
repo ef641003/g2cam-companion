@@ -82,12 +82,19 @@ object Storage {
 
     fun openVideoInTree(context: Context, name: String): VideoTarget? {
         val tree = tree(context) ?: return null
+        var uri: Uri? = null
         return try {
-            val uri = createInTree(context, tree, name, "video/mp4") ?: return null
-            val pfd = context.contentResolver.openFileDescriptor(uri, "w") ?: return null
+            uri = createInTree(context, tree, name, "video/mp4") ?: return null
+            val pfd = context.contentResolver.openFileDescriptor(uri, "w")
+            if (pfd == null) {
+                deleteQuietly(context, uri)
+                return null
+            }
             VideoTarget(uri, pfd)
         } catch (e: Exception) {
             Log.w(TAG, "選んだフォルダに動画を作れません。既定に保存します", e)
+            // 作りかけ（空のファイル）を残さない
+            uri?.let { deleteQuietly(context, it) }
             null
         }
     }
@@ -153,8 +160,9 @@ object Storage {
         val resolver = context.contentResolver
         val tree = tree(context)
         if (tree != null) {
+            var uri: Uri? = null
             try {
-                val uri = createInTree(context, tree, name, "video/mp4")
+                uri = createInTree(context, tree, name, "video/mp4")
                 if (uri != null) {
                     val pfd = resolver.openFileDescriptor(uri, "rw")
                     if (pfd != null) return VideoOutput(uri, pfd, false)
@@ -162,6 +170,8 @@ object Storage {
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "選んだフォルダに動画を作れません。既定に保存します", e)
+                // 作りかけ（空のファイル）を残さない
+                uri?.let { deleteQuietly(context, it) }
             }
         }
         return try {
