@@ -151,7 +151,8 @@ object Storage {
 
     fun openVideoOutput(context: Context, name: String): VideoOutput? {
         val resolver = context.contentResolver
-        tree(context)?.let { tree ->
+        val tree = tree(context)
+        if (tree != null) {
             try {
                 val uri = createInTree(context, tree, name, "video/mp4")
                 if (uri != null) {
