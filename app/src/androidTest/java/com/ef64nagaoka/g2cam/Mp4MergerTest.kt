@@ -7,6 +7,7 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.net.Uri
+import android.os.Bundle
 import android.os.SystemClock
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -119,6 +120,10 @@ class Mp4MergerTest {
                         codec.queueInputBuffer(i, 0, 0, pts, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                         inputDone = true
                     } else {
+                        // 1 秒ごとにキーフレーム（KEY_I_FRAME_INTERVAL を守らない符号化器もあるので、はっきり頼む）
+                        if (n > 0 && n % fps == 0) {
+                            codec.setParameters(Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) })
+                        }
                         val cap = codec.getInputBuffer(i)!!.capacity()
                         fillYuv(codec.getInputImage(i)!!, n)
                         codec.queueInputBuffer(i, 0, min(width * height * 3 / 2, cap), pts, 0)
@@ -260,6 +265,24 @@ class Mp4MergerTest {
         return Stats(v.first, v.second, v.third.first, v.third.second, a?.first ?: 0, a?.third?.first ?: true)
     }
 
+    /** 映像のキーフレームの時刻（秒。診断用） */
+    private fun syncTimes(file: File): String {
+        val ex = MediaExtractor()
+        return try {
+            ex.setDataSource(file.path)
+            val ti = (0 until ex.trackCount).first { ex.getTrackFormat(it).getString(MediaFormat.KEY_MIME)!!.startsWith("video/") }
+            ex.selectTrack(ti)
+            val out = ArrayList<String>()
+            while (ex.sampleTime >= 0) {
+                if ((ex.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) out.add(String.format(java.util.Locale.US, "%.2f", ex.sampleTime / 1e6))
+                ex.advance()
+            }
+            out.joinToString(",")
+        } finally {
+            ex.release()
+        }
+    }
+
     /** 映像を最後まで復号して、出てきたコマ数を返す（つなぎ目で壊れていないかの確認） */
     private fun decodeCount(file: File): Int {
         val ex = MediaExtractor()
@@ -316,9 +339,10 @@ class Mp4MergerTest {
         val r = merge(out, Mp4Merger.Part(prev, 3_000_000L), Mp4Merger.Part(cur, 0L))
         assertTrue(r.message, r.ok)
         val s = stats(out)
+        val keys = "材料のキーフレーム=[${syncTimes(prev)}]・できた動画のキーフレーム=[${syncTimes(out)}]"
         // キーフレームが 3 秒目ちょうどなら 9 秒・270 コマ。符号化器によって 1 つ前（2 秒目）になっても可
-        assertTrue("映像の長さ ${s.videoDurationUs}", s.videoDurationUs in 8_500_000L..10_100_000L)
-        assertTrue("映像のコマ数 ${s.videoSamples}", s.videoSamples in 260..305)
+        assertTrue("映像の長さ ${s.videoDurationUs}・$keys", s.videoDurationUs in 8_500_000L..10_100_000L)
+        assertTrue("映像のコマ数 ${s.videoSamples}・$keys", s.videoSamples in 260..305)
         assertTrue("映像の時刻が前に進んでいない", s.videoMonotonic)
         assertTrue("頭がキーフレームでない", s.firstVideoSync)
         assertTrue("音声のサンプル数 ${s.audioSamples}", s.audioSamples > 300)
@@ -337,7 +361,7 @@ class Mp4MergerTest {
         assertTrue(r.message, r.ok)
         val s = stats(out)
         // 2 秒目のキーフレームからなら 4 秒弱。少なくとも頭は切れていること
-        assertTrue("映像の長さ ${s.videoDurationUs}", s.videoDurationUs in 3_400_000L..5_500_000L)
+        assertTrue("映像の長さ ${s.videoDurationUs}・材料のキーフレーム=[${syncTimes(cur)}]", s.videoDurationUs in 3_400_000L..5_500_000L)
         assertTrue(s.firstVideoSync)
         assertTrue(s.audioMonotonic)
         assertTrue(decodeCount(out) >= s.videoSamples - 2)
@@ -352,7 +376,7 @@ class Mp4MergerTest {
         assertTrue(r.message, r.ok)
         val s = stats(out)
         assertEquals(0, s.audioSamples)
-        assertTrue("映像の長さ ${s.videoDurationUs}", s.videoDurationUs in 7_500_000L..9_100_000L)
+        assertTrue("映像の長さ ${s.videoDurationUs}・材料のキーフレーム=[${syncTimes(prev)}]", s.videoDurationUs in 7_500_000L..9_100_000L)
     }
 
     @Test
