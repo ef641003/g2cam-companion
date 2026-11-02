@@ -77,6 +77,24 @@ class StartOptions(
     val minFreeBytes: Long,
 )
 
+/** このアプリ自身の負荷と配信の様子（/status 用。adb が使えない端末で原因を見るため） */
+class LoadInfo(
+    /** このアプリの CPU（1 コアの %。計測前は -1） */
+    val cpuPct: Int,
+    /** 直近 5 分の平均 */
+    val cpuAvgPct: Int,
+    /** カメラから届いているフレーム数（fps。実測） */
+    val cameraFps: Int,
+    /** メガネ用に変換した枚数（fps） */
+    val producedFps: Int,
+    /** G2 アプリに渡した枚数（fps） */
+    val servedFps: Int,
+    /** 配信の上限 fps（設定。熱いときは半分） */
+    val streamFpsCap: Int,
+    /** いま束ねている静止画の拡張（なし / オート / HDR） */
+    val extension: String,
+)
+
 /** 遡り録画の状態（/status 用） */
 class PreRollInfo(
     /** コンパニオンの画面でオンにしているか */
@@ -138,6 +156,12 @@ interface CameraController {
     val armedQuality: String?
     /** 準備した録画の解像度（例 3840x2160。準備していない・分からなければ空） */
     val armedResolution: String
+    /** 録画の準備を休んでいる理由（"heat"）。休んでいなければ null。G2 録画はこの間、準備を頼み直さない */
+    val armPausedReason: String?
+    /** カメラを開いているか（要求が無くて閉じていれば false。次の要求で開く） */
+    val cameraOpen: Boolean
+    /** 負荷と配信の実測 */
+    val loadInfo: LoadInfo
     /** 録画を始める（ブロッキング。始まるまで待つ）。すでに録画中ならその状態を返す */
     fun startRecording(o: StartOptions): RecordingState
     /** 録画を止めて保存する（ブロッキング）。録画していなければ null */
@@ -342,6 +366,8 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
             .put("armed", camera.armedQuality != null)
             .put("armedQuality", camera.armedQuality ?: JSONObject.NULL)
             .put("armedResolution", camera.armedResolution)
+            .put("armPaused", camera.armPausedReason ?: JSONObject.NULL)
+            .put("cameraOpen", camera.cameraOpen)
             .put("recording", camera.recording != null)
             .put("pendingSegments", camera.pendingSegments)
             .put("merging", camera.mergingCount)
@@ -358,6 +384,14 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
                 .put("recordPreRollMs", r.preRollMs)
                 .put("recordBytesPerSec", r.bytesPerSec)
         }
+        val li = camera.loadInfo
+        j.put("cpuPct", li.cpuPct)
+            .put("cpuAvgPct", li.cpuAvgPct)
+            .put("cameraFps", li.cameraFps)
+            .put("producedFps", li.producedFps)
+            .put("servedFps", li.servedFps)
+            .put("streamFpsCap", li.streamFpsCap)
+            .put("extension", li.extension)
         val p = camera.preRollInfo
         j.put("preRoll", p.enabled)
             .put("preRollSec", p.seconds)

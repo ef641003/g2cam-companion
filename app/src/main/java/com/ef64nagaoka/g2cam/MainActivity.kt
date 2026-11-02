@@ -34,6 +34,8 @@ class MainActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var toggle: Button
     private lateinit var saveDir: TextView
+    private lateinit var loadText: TextView
+    private lateinit var logText: TextView
     private val handler = Handler(Looper.getMainLooper())
     private val refresh = object : Runnable {
         override fun run() {
@@ -44,6 +46,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        AppLog.init(this)
         buildUi()
         requestRuntimePermissions()
     }
@@ -101,6 +104,15 @@ class MainActivity : Activity() {
         }
         root.addView(status)
 
+        loadText = TextView(this).apply {
+            textSize = 13f
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            setBackgroundColor(0xFFF4F0E6.toInt())
+        }
+        root.addView(loadText, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            topMargin = dp(6)
+        })
+
         toggle = Button(this).apply {
             setOnClickListener { onToggle() }
         }
@@ -155,6 +167,61 @@ class MainActivity : Activity() {
                 startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
             }
         })
+        // ── 負荷を抑える設定（録画の画質には関わらない） ──
+        root.addView(TextView(this).apply {
+            text = "スマホの負荷を抑える（録画の画質は変わりません）"
+            textSize = 16f
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, dp(16), 0, dp(4))
+        })
+        root.addView(TextView(this).apply { text = "メガネへ配信する映像の上限" })
+        val fpsGroup = RadioGroup(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val nowFps = Prefs.streamFps(this)
+        for (fps in intArrayOf(10, 15, 30)) {
+            val b = RadioButton(this).apply {
+                id = View.generateViewId()
+                text = "$fps fps"
+            }
+            fpsGroup.addView(b)
+            if (fps == nowFps) fpsGroup.check(b.id)
+            b.setOnCheckedChangeListener { _, checked ->
+                if (checked) {
+                    Prefs.setStreamFps(this@MainActivity, fps)
+                    notifyPrefsChanged()
+                }
+            }
+        }
+        root.addView(fpsGroup)
+        root.addView(TextView(this).apply {
+            text = "メガネには 5〜9fps しか送れないので 15 で足ります（30 は以前の動き。変換の仕事が倍になります）"
+            textSize = 13f
+            setPadding(0, 0, 0, dp(4))
+        })
+        root.addView(CheckBox(this).apply {
+            text = "誰も映像を取りに来なくなったら（20 秒）カメラを閉じる。次の要求で開き直す（最初の 1 枚が 1 秒ほど遅れる）"
+            isChecked = Prefs.idleCameraOff(this@MainActivity)
+            setOnCheckedChangeListener { _, checked -> Prefs.setIdleCameraOff(this@MainActivity, checked) }
+        })
+        root.addView(CheckBox(this).apply {
+            text = "待機中（録画の準備中・録画中ではないとき）はカメラのセンサーを 15fps にする。反映は次にカメラを開始したとき"
+            isChecked = Prefs.idleSensorFps(this@MainActivity)
+            setOnCheckedChangeListener { _, checked -> Prefs.setIdleSensorFps(this@MainActivity, checked) }
+        })
+        root.addView(CheckBox(this).apply {
+            text = "静止画の高画質（端末の HDR・オート）は撮影の前後だけ使う（待機中は通常の組み方。最初の 1 枚が 1 秒ほど遅れる）。反映は次にカメラを開始したとき"
+            isChecked = Prefs.extensionOnDemand(this@MainActivity)
+            setOnCheckedChangeListener { _, checked -> Prefs.setExtensionOnDemand(this@MainActivity, checked) }
+        })
+        root.addView(CheckBox(this).apply {
+            text = "待機モードでは透明な窓を出し続ける（Android 15 以降で裏から起動するのに必要。切ると起動要求のときだけ出す。重くなる端末では切って比べる）"
+            isChecked = Prefs.standbyOverlayAlways(this@MainActivity)
+            setOnCheckedChangeListener { _, checked ->
+                Prefs.setStandbyOverlayAlways(this@MainActivity, checked)
+                if (StandbyService.running) startService(Intent(this@MainActivity, StandbyService::class.java).setAction(StandbyService.ACTION_OVERLAY_CHANGED))
+                handler.postDelayed({ render() }, 300)
+            }
+        })
+
         root.addView(CheckBox(this).apply {
             text = "手ブレ補正を使う（光学式があれば静止画・配信に、動画は電子式も。非対応の端末では自動で外れます）。反映は次にカメラを開始したとき"
             isChecked = Prefs.stabilization(this@MainActivity)
@@ -227,6 +294,42 @@ class MainActivity : Activity() {
             setOnCheckedChangeListener { _, checked -> Prefs.setAutoStop(this@MainActivity, checked) }
         })
 
+        // ── ログ ──
+        root.addView(TextView(this).apply {
+            text = "ログ（新しい順。起動・停止・起動要求・カメラの開閉・負荷の異常・発熱）"
+            textSize = 16f
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, dp(16), 0, dp(4))
+        })
+        logText = TextView(this).apply {
+            textSize = 12f
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            setBackgroundColor(0xFFEFEFEF.toInt())
+            typeface = Typeface.MONOSPACE
+        }
+        root.addView(logText)
+        root.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(Button(this@MainActivity).apply {
+                text = "ログを共有"
+                setOnClickListener {
+                    val body = "G2 カメラ コンパニオン ${appVersion()} のログ\n${LoadMonitor.describe()}\n\n${AppLog.all()}"
+                    startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+                        type = "text/plain"
+                        putExtra(Intent.EXTRA_SUBJECT, "G2 カメラ コンパニオンのログ")
+                        putExtra(Intent.EXTRA_TEXT, body)
+                    }, "ログを共有"))
+                }
+            })
+            addView(Button(this@MainActivity).apply {
+                text = "ログを消す"
+                setOnClickListener {
+                    AppLog.clear()
+                    render()
+                }
+            })
+        })
+
         root.addView(TextView(this).apply {
             text = "使いかた\n" +
                 "・G2 カメラを開くと自動でカメラを始めるには、上の「待機モード」をオンにして「他のアプリの上に表示」を許可してください（G2 カメラを終了すると自動で止まります）。\n" +
@@ -241,6 +344,20 @@ class MainActivity : Activity() {
         })
 
         setContentView(ScrollView(this).apply { addView(root) })
+    }
+
+    private fun appVersion(): String = try {
+        packageManager.getPackageInfo(packageName, 0).versionName ?: "?"
+    } catch (e: Exception) {
+        "?"
+    }
+
+    /** 動いているサービスに設定が変わったことを伝える（配信の fps など。止まっていれば次の開始時に読む） */
+    private fun notifyPrefsChanged() {
+        if (CameraService.running) {
+            startService(Intent(this, CameraService::class.java).setAction(CameraService.ACTION_PREFS_CHANGED))
+        }
+        handler.postDelayed({ render() }, 300)
     }
 
     /** 動いているサービスに遡り録画の設定が変わったことを伝える（止まっていれば次の開始時に読む） */
@@ -298,6 +415,7 @@ class MainActivity : Activity() {
             lines.add("配信したフレーム：${CameraService.framesServed}　撮影した枚数：${CameraService.photosTaken}")
             CameraService.recordingLabel?.let { lines.add("● 録画中 $it") }
             CameraService.monitorLabel?.let { lines.add("スマホ：$it") }
+            CameraService.streamLabel?.let { lines.add(it) }
         }
         lines.add(
             "遡り録画：" + (
@@ -310,9 +428,33 @@ class MainActivity : Activity() {
         lines.add("電池の最適化の除外：" + if (battery) "OK" else "未設定（推奨）")
         val overlayOk = Settings.canDrawOverlays(this)
         lines.add(
-            "待機モード：" + (if (StandbyService.running) "● 待機中（起動要求 ${StandbyService.launchCount} 回）" else "○ オフ") +
+            "待機モード：" + (if (StandbyService.running) "● 待機中（起動要求 ${StandbyService.launchCount} 回・透明な窓 ${if (StandbyService.overlayShown) "あり" else "なし"}・${StandbyService.serverStats}）" else "○ オフ") +
                 "　他のアプリの上に表示：" + if (overlayOk) "OK" else "未許可",
         )
+        if (StandbyService.running) {
+            val restarts = Prefs.standbyStartsWithin(this, 60 * 60_000L)
+            if (restarts > 1) lines.add("⚠ 待機サービスがこの 1 時間に $restarts 回始まっています（システムに止められて再起動している可能性）")
+            if (StandbyService.cpuAlarms > 0) lines.add("⚠ 待機中なのに CPU が高い状態を ${StandbyService.cpuAlarms} 回見つけました（ログ参照）")
+        }
+        // 負荷：このアプリ自身の CPU（カメラの HAL・Even アプリ側は含まない）と、スマホの温度・発熱の段階
+        val mon = try {
+            DeviceMonitor.read(this)
+        } catch (e: Exception) {
+            null
+        }
+        val thermal = mon?.thermal ?: 0
+        val thermalText = when {
+            thermal >= PowerManager.THERMAL_STATUS_SEVERE -> "発熱 段階$thermal（重い・遅くなる段階）"
+            thermal >= PowerManager.THERMAL_STATUS_MODERATE -> "発熱 段階$thermal（少し熱い）"
+            thermal >= PowerManager.THERMAL_STATUS_LIGHT -> "発熱 段階$thermal（軽い）"
+            else -> "発熱なし"
+        }
+        val temp = mon?.tempC?.takeIf { !it.isNaN() }?.let { String.format(java.util.Locale.US, "%.1f度", it) } ?: "温度不明"
+        LoadMonitor.tick()
+        loadText.text = "負荷（このアプリ自身。カメラの HAL や Even アプリの分は含まない）\n" +
+            (if (CameraService.running || StandbyService.running) LoadMonitor.describe() else "サービスが動いていないので計測していません") +
+            "\nスマホ：$temp・$thermalText" + (mon?.let { if (it.batteryPct >= 0) "・電池 ${it.batteryPct}%" else "" } ?: "")
+        logText.text = AppLog.recent(40).ifEmpty { "（まだありません）" }
         CameraService.lastError?.let { lines.add("⚠ $it") }
         CameraService.diagText?.let { lines.add("構成：$it") }
         saveDir.text = "保存先：" + Storage.describe(this)

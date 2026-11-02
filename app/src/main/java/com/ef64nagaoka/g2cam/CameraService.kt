@@ -10,8 +10,6 @@ import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
-import android.graphics.Bitmap
-import android.graphics.Matrix
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
@@ -91,6 +89,8 @@ class CameraService : LifecycleService(), CameraController {
         const val ACTION_STOP_RECORDING = "com.ef64nagaoka.g2cam.STOP_RECORDING"
         /** 本体の画面で遡り録画の設定を変えた */
         const val ACTION_PREROLL_CHANGED = "com.ef64nagaoka.g2cam.PREROLL_CHANGED"
+        /** 本体の画面で配信の fps などの設定を変えた */
+        const val ACTION_PREFS_CHANGED = "com.ef64nagaoka.g2cam.PREFS_CHANGED"
         /** G2 カメラからの要求が途絶えてから自動で止めるまで（ミリ秒） */
         private const val IDLE_STOP_MS = 120_000L
         /** G2 録画からの要求が途絶えてから、録画の準備（と遡り録画の録りため）を解くまで */
@@ -105,6 +105,12 @@ class CameraService : LifecycleService(), CameraController {
         private const val BUFFER_RESUME_FREE = 1536L * MB
         /** 区切り録画で書き終えたファイルを、G2 録画が取りに来るまで持っておく最大の本数 */
         private const val MAX_SEGMENT_QUEUE = 50
+        /** 映像を取りに来なくなってからこれだけ経ったら、フレームの変換をやめる */
+        private const val FRAME_DEMAND_MS = 2_000L
+        /** 何の要求も無くなってからこれだけ経ったら、カメラを閉じる（サービスは残す） */
+        private const val IDLE_CAMERA_MS = 20_000L
+        /** 撮影のあと、静止画の拡張つきの組み方を保っておく時間 */
+        private const val EXTENSION_KEEP_MS = 60_000L
 
         @Volatile var running = false
         @Volatile var lastError: String? = null
@@ -116,6 +122,8 @@ class CameraService : LifecycleService(), CameraController {
         @Volatile var diagText: String? = null
         /** 画面表示用：電池・温度・空き容量（5 秒ごとに更新） */
         @Volatile var monitorLabel: String? = null
+        /** 画面表示用：配信の様子（カメラの開閉・fps） */
+        @Volatile var streamLabel: String? = null
         @Volatile private var instance: CameraService? = null
         /** 書き出し中の名前（プロセス全体。サービスを作り直したときの書き出し直しで重ねないため） */
         private val activeMerges: MutableSet<String> = java.util.Collections.synchronizedSet(HashSet())
@@ -179,6 +187,32 @@ class CameraService : LifecycleService(), CameraController {
     private var frameSeq = System.currentTimeMillis()
     override val hasFrame: Boolean get() = latestFrame != null
     private var lastFrameAt = 0L
+    /** 解析スレッドだけで使う（Bitmap を使い回す） */
+    private val frameEncoder = FrameEncoder()
+    /** 最後に /frame を取りに来た時刻。これが古ければ変換しない */
+    @Volatile private var lastFrameRequestAt = 0L
+    /** 配信の上限（ms 間隔。設定の fps から。熱いときは倍） */
+    @Volatile private var streamIntervalMs = 66L
+    @Volatile private var hotNow = false
+    // fps の実測（1 秒ごとに締める）
+    private var fpsWindowStart = 0L
+    private var fpsCamera = 0
+    private var fpsProduced = 0
+    @Volatile private var fpsServedCount = 0
+    @Volatile private var measuredCameraFps = 0
+    @Volatile private var measuredProducedFps = 0
+    @Volatile private var measuredServedFps = 0
+    /** 誰も使っていないのでカメラを閉じている（サービスは動いている） */
+    @Volatile private var cameraIdle = false
+    @Volatile private var reopening = false
+    /** 静止画の拡張（HDR・オート）：いま束ねているか・端末で使えるか・直近の撮影 */
+    @Volatile private var extensionBound = false
+    @Volatile private var extensionAvailable: Boolean? = null
+    @Volatile private var extensionWanted = false
+    @Volatile private var lastCaptureAt = 0L
+    /** 録画の準備を高温で休んでいる（"heat"）。冷えたら lastArm で準備し直す */
+    @Volatile private var armPaused: String? = null
+    @Volatile private var lastArm: ArmRequest? = null
 
     // ── 録画の部品 ──
 
@@ -266,6 +300,18 @@ class CameraService : LifecycleService(), CameraController {
     override val recording: RecordingState? get() = session?.let { snapshot(it) }
     override val armedQuality: String? get() = armed?.quality
     override val armedResolution: String get() = armed?.resolution ?: ""
+    override val armPausedReason: String? get() = armPaused
+    override val cameraOpen: Boolean get() = camera != null && !cameraIdle
+    override val loadInfo: LoadInfo
+        get() = LoadInfo(
+            cpuPct = LoadMonitor.latest?.cpuPct ?: -1,
+            cpuAvgPct = LoadMonitor.avgPct,
+            cameraFps = measuredCameraFps,
+            producedFps = measuredProducedFps,
+            servedFps = measuredServedFps,
+            streamFpsCap = (1000 / streamIntervalMs).toInt(),
+            extension = if (extensionBound) extensionLabel else "なし",
+        )
 
     /** このサービスで録画したファイル（名前 → URI）。/file で返すときに使う */
     private val recentFiles = ConcurrentHashMap<String, Uri>()
@@ -299,9 +345,16 @@ class CameraService : LifecycleService(), CameraController {
 
     private fun buildDiag(): String {
         val a = armed
-        val ready = if (a != null) "準備済み（${a.quality} ${a.resolution.ifEmpty { "解像度不明" }}${if (a.still) "・撮影あり" else ""}）" else "なし"
-        return "構成=$boundLabel・静止画の拡張=$extensionLabel・手ブレ補正=$stabLabel・録画の解像度=$recordResLabel・録画の準備=$ready・保存先=${Storage.describe(this)}" +
+        val ready = if (a != null) "準備済み（${a.quality} ${a.resolution.ifEmpty { "解像度不明" }}${if (a.still) "・撮影あり" else ""}）" else if (armPaused != null) "休止中（高温）" else "なし"
+        return "構成=${if (cameraIdle) "カメラを閉じている（待機）" else boundLabel}・静止画の拡張=$extensionLabel・手ブレ補正=$stabLabel・録画の解像度=$recordResLabel・録画の準備=$ready・保存先=${Storage.describe(this)}" +
             (if (bindNotes.isNotEmpty()) "・束ね直しの失敗=$bindNotes" else "")
+    }
+
+    private fun buildStreamLabel(): String {
+        val cap = (1000 / streamIntervalMs).toInt()
+        val cam = if (cameraIdle) "カメラ: 閉じている（要求が来たら開く）" else "カメラ: 開いている（実測 ${measuredCameraFps}fps）"
+        val demand = if (SystemClock.elapsedRealtime() - lastFrameRequestAt < FRAME_DEMAND_MS) "配信中 ${measuredProducedFps}fps（上限 $cap・渡した ${measuredServedFps}fps）" else "配信なし（取りに来ていないので変換していない）"
+        return "$cam　$demand"
     }
 
     // G2 カメラ側とのつながり（終了に合わせた自動停止）
@@ -322,6 +375,30 @@ class CameraService : LifecycleService(), CameraController {
                 shutdownGracefully(cancellable = true)
                 return
             }
+            // 誰も使っていない：カメラを閉じる（サービスは残す。次の要求で開き直す）
+            if (!cameraIdle && !reopening && camera != null && session == null && armed == null && bufCur == null && !stopping &&
+                clientSeen && idle > IDLE_CAMERA_MS && Prefs.idleCameraOff(this@CameraService)
+            ) {
+                closeCameraForIdle()
+            }
+            // 撮影してしばらく経った：静止画の拡張つきの組み方から通常に戻す（拡張は待機中も重い）
+            if (extensionBound && extensionWanted && session == null && armed == null && !cameraIdle && !stopping &&
+                SystemClock.elapsedRealtime() - lastCaptureAt > EXTENSION_KEEP_MS && Prefs.extensionOnDemand(this@CameraService)
+            ) {
+                extensionWanted = false
+                postWork {
+                    synchronized(recordLock) {
+                        if (session == null && armed == null && extensionBound && !cameraIdle) {
+                            AppLog.i("撮影から ${EXTENSION_KEEP_MS / 1000} 秒経ったので、静止画の拡張を外して通常の組み方に戻します")
+                            try {
+                                rebindAndWait(null)
+                            } catch (e: Exception) {
+                                Log.w(TAG, "rebind (extension off) failed", e)
+                            }
+                        }
+                    }
+                }
+            }
             // G2 録画が閉じられたまま：準備（遡り録画の録りため）を解いて電池を守る
             if (armed != null && session == null && clientSeen && idle > DISARM_IDLE_MS && !disarmPosted) {
                 disarmPosted = true
@@ -329,7 +406,9 @@ class CameraService : LifecycleService(), CameraController {
                     try {
                         synchronized(recordLock) {
                             if (session == null && SystemClock.elapsedRealtime() - lastClientAt > DISARM_IDLE_MS) {
-                                Log.i(TAG, "G2 録画からの応答が途絶えたので、録画の準備を解きます")
+                                AppLog.i("G2 録画からの応答が途絶えたので、録画の準備を解きます")
+                                lastArm = null
+                                armPaused = null
                                 disarmLocked()
                             }
                         }
@@ -375,6 +454,15 @@ class CameraService : LifecycleService(), CameraController {
                 postWork { stopRecordingInternally("通知") }
                 return START_NOT_STICKY
             }
+            ACTION_PREFS_CHANGED -> {
+                if (!running) {
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
+                refreshStreamInterval()
+                AppLog.i("配信の上限を ${Prefs.streamFps(this)}fps にしました")
+                return START_NOT_STICKY
+            }
             ACTION_PREROLL_CHANGED -> {
                 if (!running) {
                     stopSelf()
@@ -404,6 +492,7 @@ class CameraService : LifecycleService(), CameraController {
             refreshNotification()
         }
         if (!running) {
+            AppLog.init(this)
             if (!startInForeground()) {
                 stopSelf()
                 return START_NOT_STICKY
@@ -411,6 +500,9 @@ class CameraService : LifecycleService(), CameraController {
             running = true
             stopping = false
             instance = this
+            refreshStreamInterval()
+            LoadMonitor.tick()
+            AppLog.i("カメラのサービスを開始")
             lastError = null
             framesServed = 0
             photosTaken = 0
@@ -434,6 +526,8 @@ class CameraService : LifecycleService(), CameraController {
         recordingLabel = null
         diagText = null
         monitorLabel = null
+        streamLabel = null
+        AppLog.i("カメラのサービスを終了")
         mainHandler.removeCallbacks(idleWatchdog)
         mainHandler.removeCallbacks(healthTick)
         bufTimer?.let { mainHandler.removeCallbacks(it) }
@@ -443,7 +537,8 @@ class CameraService : LifecycleService(), CameraController {
         server = null
         wakeLock?.let { if (it.isHeld) it.release() }
         super.onDestroy() // カメラの unbind を先に済ませてから実行系を止める
-        analysisExecutor.shutdownNow()
+        analysisExecutor.execute { frameEncoder.release() }
+        analysisExecutor.shutdown()
         ioExecutor.shutdownNow()
         recorderExecutor.shutdownNow()
         workExecutor.shutdownNow()
@@ -568,11 +663,12 @@ class CameraService : LifecycleService(), CameraController {
             s != null -> "録画中（${if (s.audio) "音声あり" else "無音"}${if (s.segment > 1) "・${s.segment} 本目" else ""}）"
             bufCur != null -> "遡り録画の録りため中（直前 ${Prefs.preRollSeconds(this)} 秒）"
             armed != null -> "録画の準備ができています"
+            cameraIdle -> "待機中（カメラを閉じています。G2 アプリが映像を取りに来たら開きます）"
             else -> null
         }
         val merge = if (merging.isNotEmpty()) "動画を書き出し中（${merging.size} 本${if (stopping) "。済んだら止まります" else ""}）" else null
         val text = listOfNotNull(main, merge).joinToString("・").ifEmpty { null }
-        val key = "$text|${s != null}"
+        val key = "$text|${s != null}|$cameraIdle"
         if (key == lastNotificationText) return
         lastNotificationText = key
         try {
@@ -602,11 +698,78 @@ class CameraService : LifecycleService(), CameraController {
         }
     }
 
+    /** カメラを開いている間だけ CPU を眠らせない（閉じている間は手放す） */
     private fun acquireWakeLock() {
-        val pm = getSystemService(PowerManager::class.java)
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "g2cam:service").apply {
+        val w = wakeLock ?: getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "g2cam:service").apply {
             setReferenceCounted(false)
-            acquire()
+        }.also { wakeLock = it }
+        if (!w.isHeld) w.acquire()
+    }
+
+    private fun releaseWakeLock() {
+        wakeLock?.let { if (it.isHeld) it.release() }
+    }
+
+    /** 設定の fps → 配信の間隔。熱いときは倍にする */
+    private fun refreshStreamInterval() {
+        val fps = Prefs.streamFps(this)
+        val base = (1000 / fps).toLong().coerceAtLeast(33L)
+        streamIntervalMs = if (hotNow) base * 2 else base
+    }
+
+    /** 誰も使っていないのでカメラを閉じる（サービス・HTTP は残す）。次の要求で wakeCamera が開き直す */
+    private fun closeCameraForIdle() {
+        cameraIdle = true
+        AppLog.i("${IDLE_CAMERA_MS / 1000} 秒要求が無いのでカメラを閉じます（サービスは残す）")
+        mainHandler.post {
+            try {
+                ProcessCameraProvider.getInstance(this).get().unbindAll()
+            } catch (e: Exception) {
+                Log.w(TAG, "unbind failed", e)
+            }
+            camera = null
+            imageAnalysis = null
+            imageCapture = null
+            videoCapture = null
+            extensionBound = false
+            frameLock.withLock { latestFrame = null }
+            orientationListener?.disable()
+            releaseWakeLock()
+            refreshNotification()
+            diagText = buildDiag()
+            streamLabel = buildStreamLabel()
+        }
+    }
+
+    /** 閉じていたカメラを開き直す（要求が来たとき。メイン以外からも呼べる） */
+    private fun wakeCamera(why: String) {
+        if (!cameraIdle || reopening || !running || stopping) return
+        reopening = true
+        AppLog.i("要求が来たのでカメラを開きます（$why）")
+        mainHandler.post {
+            acquireWakeLock()
+            orientationListener?.enable()
+            bindCamera(null, Runnable {
+                cameraIdle = false
+                reopening = false
+                refreshNotification()
+            })
+        }
+    }
+
+    /** recordLock の中で：カメラが閉じていれば開き直して待つ */
+    private fun ensureCameraLocked() {
+        if (!cameraIdle) return
+        AppLog.i("要求が来たのでカメラを開きます（同期）")
+        onMainAndWait {
+            acquireWakeLock()
+            orientationListener?.enable()
+        }
+        try {
+            rebindAndWait(null)
+        } finally {
+            cameraIdle = false
+            reopening = false
         }
     }
 
@@ -703,8 +866,21 @@ class CameraService : LifecycleService(), CameraController {
     }
 
     /** 静止画のユースケース。高画質モードなら最高画質・最大解像度・ノイズ低減と輪郭を高品質に */
+    /** 待機中のセンサー fps。端末が持つ範囲のうち、上限 15 以下で下限が一番高いもの（[15,15] が理想）。無ければ null */
+    private fun idleFpsRange(): android.util.Range<Int>? = try {
+        val cm = getSystemService(CameraManager::class.java)
+        val want = if (facingValue == "user") CameraCharacteristics.LENS_FACING_FRONT else CameraCharacteristics.LENS_FACING_BACK
+        val ranges = cm.cameraIdList
+            .map { cm.getCameraCharacteristics(it) }
+            .firstOrNull { it.get(CameraCharacteristics.LENS_FACING) == want }
+            ?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: emptyArray()
+        ranges.filter { it.upper in 10..15 && it.lower >= 7 }.maxByOrNull { it.lower * 100 + it.upper }
+    } catch (e: Exception) {
+        null
+    }
+
     @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
-    private fun buildCapture(recording: Boolean, withInterop: Boolean): ImageCapture {
+    private fun buildCapture(recording: Boolean, withInterop: Boolean, fpsRange: android.util.Range<Int>? = null): ImageCapture {
         val hq = Prefs.highQuality(this) && !recording
         val b = ImageCapture.Builder()
             .setCaptureMode(if (hq) ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY else ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
@@ -739,6 +915,13 @@ class CameraService : LifecycleService(), CameraController {
                 Log.w(TAG, "ois failed", e)
             }
         }
+        if (withInterop && fpsRange != null) {
+            try {
+                Camera2Interop.Extender(b).setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
+            } catch (e: Exception) {
+                Log.w(TAG, "fps range (capture) failed", e)
+            }
+        }
         return b.build()
     }
 
@@ -767,7 +950,9 @@ class CameraService : LifecycleService(), CameraController {
         future.addListener({
             try {
                 val provider = future.get()
-                if (spec == null && Prefs.highQuality(this)) {
+                // 静止画の拡張（HDR・オート）は、設定が「撮影の前後だけ」なら撮影の直前に求められたときだけ束ねる（待機中は通常の組み方）
+                val wantExt = spec == null && Prefs.highQuality(this) && (!Prefs.extensionOnDemand(this) || extensionWanted)
+                if (wantExt) {
                     val extFuture = ExtensionsManager.getInstanceAsync(this, provider)
                     extFuture.addListener({
                         val ext = try {
@@ -817,6 +1002,16 @@ class CameraService : LifecycleService(), CameraController {
                     Log.w(TAG, "ois (analysis) failed", e)
                 }
             }
+            // 配信＋撮影だけ（録画の準備でも録画中でもない）なら、センサーを 15fps 前後に落として ISP の仕事を減らす。
+            // 録画の組み方（spec あり）には付けないので、録画の画質・fps は変わらない
+            val idleRange = if (spec == null && ext == null && Prefs.idleSensorFps(this)) idleFpsRange() else null
+            if (idleRange != null) {
+                try {
+                    Camera2Interop.Extender(analysisBuilder).setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, idleRange)
+                } catch (e: Exception) {
+                    Log.w(TAG, "fps range (analysis) failed", e)
+                }
+            }
             // 録画つきなら、配信も録画と同じモードで安定化する（束ねたカメラ全体で 1 つのモードに揃える）
             val eisMode = spec?.eis?.takeIf { it > 0 }
             if (eisMode != null) {
@@ -863,10 +1058,11 @@ class CameraService : LifecycleService(), CameraController {
                 extensionSelector(ext, base)?.let { (sel, label) ->
                     attempts.add(Attempt(sel, listOf(analysis, buildCapture(false, withInterop = false)), "配信+撮影", label))
                 }
-                val cap = buildCapture(recording = false, withInterop = true)
+                val cap = buildCapture(recording = false, withInterop = true, fpsRange = idleRange)
                 attempts.add(Attempt(base, listOf(analysis, cap), "配信+撮影", "なし"))
                 attempts.add(Attempt(base, listOf(analysis), "配信のみ", "なし"))
             }
+            if (ext != null) extensionAvailable = extensionSelector(ext, base) != null
 
             var bound: Camera? = null
             var used: Attempt? = null
@@ -896,6 +1092,7 @@ class CameraService : LifecycleService(), CameraController {
                 (if (!withVideo) "（録画の組み方ではない）" else if (eisOn) (if (eisMode == 2) "オン（プレビュー安定化）" else "オン（通常）") else "オフ") +
                 "・端末の対応モード=" + availableStabModes().joinToString(",")
             extensionLabel = used.extension
+            extensionBound = used.extension != "なし"
             imageAnalysis = used.cases.filterIsInstance<ImageAnalysis>().firstOrNull()
             imageCapture = used.cases.filterIsInstance<ImageCapture>().firstOrNull()
             videoCapture = if (withVideo) video else null
@@ -925,31 +1122,29 @@ class CameraService : LifecycleService(), CameraController {
         if (!latch.await(6, TimeUnit.SECONDS)) throw IllegalStateException("カメラの切り替えがタイムアウトしました")
     }
 
-    /** 解析フレーム → 長辺 320px の JPEG にして最新として保持する */
+    /**
+     * 解析フレーム → 長辺 320px の JPEG にして最新として保持する。
+     * 誰も取りに来ていない間（G2 アプリを閉じている・映像を止めている）は変換しない。
+     * 配信の上限 fps（設定。既定 15）を超える分は捨てる。Bitmap は使い回す（FrameEncoder）
+     */
     private fun handleFrame(image: ImageProxy) {
         try {
             val now = SystemClock.elapsedRealtime()
-            if (now - lastFrameAt < 30) return // 30fps まで通す（カメラ側が 30fps なので実質すべて）
+            countFps(now, camera = true, produced = false)
+            if (now - lastFrameRequestAt > FRAME_DEMAND_MS) return
+            if (now - lastFrameAt < streamIntervalMs) return
             lastFrameAt = now
 
-            val src = image.toBitmap()
-            val scale = 320f / max(image.width, image.height)
-            val m = Matrix()
-            m.postRotate(image.imageInfo.rotationDegrees.toFloat())
-            m.postScale(scale, scale)
-            val out = Bitmap.createBitmap(src, 0, 0, src.width, src.height, m, true)
-            val stream = ByteArrayOutputStream(24 * 1024)
-            out.compress(Bitmap.CompressFormat.JPEG, 70, stream)
-            frameW = out.width
-            frameH = out.height
-            val bytes = stream.toByteArray()
+            val plane = image.planes[0]
+            val bytes = frameEncoder.encode(image.width, image.height, plane.buffer, plane.rowStride, plane.pixelStride, image.imageInfo.rotationDegrees)
+            frameW = frameEncoder.outWidth
+            frameH = frameEncoder.outHeight
+            countFps(now, camera = false, produced = true)
             frameLock.withLock {
                 frameSeq += 1
                 latestFrame = Frame(frameSeq, bytes)
                 frameArrived.signalAll()
             }
-            if (out !== src) out.recycle()
-            src.recycle()
         } catch (e: Exception) {
             Log.w(TAG, "frame failed", e)
         } finally {
@@ -957,13 +1152,36 @@ class CameraService : LifecycleService(), CameraController {
         }
     }
 
+    /** 1 秒ごとに、カメラから来た枚数・変換した枚数・渡した枚数を締める（解析スレッドで） */
+    private fun countFps(now: Long, camera: Boolean, produced: Boolean) {
+        if (camera) fpsCamera++
+        if (produced) fpsProduced++
+        if (fpsWindowStart == 0L) fpsWindowStart = now
+        val span = now - fpsWindowStart
+        if (span >= 1000) {
+            measuredCameraFps = (fpsCamera * 1000 / span).toInt()
+            measuredProducedFps = (fpsProduced * 1000 / span).toInt()
+            measuredServedFps = (fpsServedCount * 1000 / span).toInt()
+            fpsCamera = 0
+            fpsProduced = 0
+            fpsServedCount = 0
+            fpsWindowStart = now
+            streamLabel = buildStreamLabel()
+        }
+    }
+
     override fun nextFrame(afterSeq: Long, waitMs: Long): Frame? {
-        var remainNs = TimeUnit.MILLISECONDS.toNanos(waitMs)
+        lastFrameRequestAt = SystemClock.elapsedRealtime()
+        if (cameraIdle) wakeCamera("映像")
+        // 開き直し・起動の直後で 1 枚も無いときは、最初の 1 枚を長めに待つ（G2 アプリに 503 を返して取り直させない）
+        val wait = if (latestFrame == null && (reopening || cameraIdle || camera != null)) maxOf(waitMs, 1500L) else waitMs
+        var remainNs = TimeUnit.MILLISECONDS.toNanos(wait)
         frameLock.withLock {
             while (true) {
                 val f = latestFrame
                 if (f != null && f.seq > afterSeq) {
                     framesServed++
+                    fpsServedCount++
                     // 映像を取りに来ている = G2 カメラがまた動いている。録画後の自動停止・書き出し待ちの停止は取り消す
                     stopWhenRecordingEnds = false
                     if (stopping) cancelStop("映像")
@@ -994,7 +1212,8 @@ class CameraService : LifecycleService(), CameraController {
     }
 
     override fun setZoom(zoom: Double): Float {
-        val cam = camera ?: return 1f
+        if (cameraIdle) wakeCamera("ズーム")
+        val cam = camera ?: return zoomNow
         val state = cam.cameraInfo.zoomState.value
         val target = if (state != null) zoom.toFloat().coerceIn(state.minZoomRatio, state.maxZoomRatio) else 1f
         // 結果は待たない（ズーム中も映像は流れ続ける）。1 未満なら端末が超広角に、大きければ望遠に切り替える
@@ -1009,6 +1228,11 @@ class CameraService : LifecycleService(), CameraController {
         synchronized(recordLock) {
             if (session != null) throw IllegalStateException("録画中はカメラを切り替えられません")
             stopBufferLocked()
+            cameraIdle = false // このあと束ね直すので、閉じていても開く
+            onMainAndWait {
+                acquireWakeLock()
+                orientationListener?.enable()
+            }
             facingValue = next
             zoomNow = 1f
             frameLock.withLock { latestFrame = null }
@@ -1032,11 +1256,15 @@ class CameraService : LifecycleService(), CameraController {
     }
 
     override fun capture(): ByteArray = synchronized(captureLock) {
-        if (imageCapture == null && session == null && (armed != null || videoCapture != null)) {
-            // G2 録画の準備（静止画を束ねない組み方）のまま、または束ね直しが遅れて録画の組み方のまま撮影を頼まれた：撮影できる組み方に戻す
-            synchronized(recordLock) {
-                if (session == null && imageCapture == null) {
+        lastCaptureAt = SystemClock.elapsedRealtime()
+        synchronized(recordLock) {
+            if (session == null) {
+                if (cameraIdle) ensureCameraLocked()
+                if (imageCapture == null && (armed != null || videoCapture != null)) {
+                    // G2 録画の準備（静止画を束ねない組み方）のまま、または束ね直しが遅れて録画の組み方のまま撮影を頼まれた：撮影できる組み方に戻す
                     if (armed != null) {
+                        lastArm = null
+                        armPaused = null
                         disarmLocked()
                     } else if (videoCapture != null && running) {
                         try {
@@ -1045,6 +1273,16 @@ class CameraService : LifecycleService(), CameraController {
                             Log.w(TAG, "rebind for capture failed", e)
                         }
                     }
+                }
+                // 高画質（端末の拡張）を「撮影の前後だけ」にしているとき：拡張が使える端末なら、撮影の前に拡張つきで束ね直す（1 秒ほど）
+                if (Prefs.highQuality(this) && Prefs.extensionOnDemand(this) && !extensionBound && extensionAvailable != false && running) {
+                    extensionWanted = true
+                    try {
+                        rebindAndWait(null)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "rebind (extension on) failed", e)
+                    }
+                    if (!extensionBound) AppLog.i("静止画の拡張は使えません（この端末、またはこの組み方では）。通常の撮影にします")
                 }
             }
         }
@@ -1377,17 +1615,22 @@ class CameraService : LifecycleService(), CameraController {
         synchronized(recordLock) {
             if (off) {
                 pendingArm = null
+                lastArm = null
+                armPaused = null
                 disarmLocked()
                 return
             }
             if (!running) throw IllegalStateException("カメラが起動していません")
             if (!cancelStop("録画の準備")) throw IllegalStateException("コンパニオンを止めています（動画の書き出しが済むと止まります）")
             val req = ArmRequest(quality, audio, still, stopTempC)
+            lastArm = req
             if (session != null) {
                 // 録画中：録画が終わってから準備し直す
                 pendingArm = req
                 return
             }
+            if (armPaused != null) return // 高温で休んでいる：冷えたら見張りが準備し直す
+            if (cameraIdle) ensureCameraLocked()
             armLocked(req)
         }
     }
@@ -1580,6 +1823,7 @@ class CameraService : LifecycleService(), CameraController {
         synchronized(recordLock) {
             session?.let { return snapshot(it) }
             if (!cancelStop("録画")) throw IllegalStateException("コンパニオンを止めています（動画の書き出しが済むと止まります）")
+            if (cameraIdle) ensureCameraLocked()
             if (camera == null) throw IllegalStateException("カメラが起動していません（止める途中から戻ったところなら、少し待ってからもう一度）")
             val thumb = latestFrame?.bytes
             val withAudio = o.audio && audioPermitted
@@ -1851,10 +2095,24 @@ class CameraService : LifecycleService(), CameraController {
         return parts.joinToString("・")
     }
 
+    private var lastThermal = -1
+
     private fun checkHealth() {
         val m = DeviceMonitor.read(this)
         lastMonitor = m
         monitorLabel = describeMonitor(m)
+        LoadMonitor.tick()
+        if (m.thermal != lastThermal) {
+            if (lastThermal >= 0 || m.thermal > 0) AppLog.i("発熱の段階が $lastThermal → ${m.thermal} に変わりました（${if (m.tempC.isNaN()) "温度不明" else "${fmt1(m.tempC)}度"}・CPU ${LoadMonitor.latest?.cpuPct ?: -1}%）")
+            lastThermal = m.thermal
+        }
+        val hot = m.thermal >= PowerManager.THERMAL_STATUS_SEVERE
+        if (hot != hotNow) {
+            hotNow = hot
+            refreshStreamInterval()
+            AppLog.i(if (hot) "熱いので配信の fps を半分にします" else "冷えたので配信の fps を戻します")
+        }
+        streamLabel = buildStreamLabel()
         val s = session
         if (s != null) {
             val hot = (s.opts.stopTempC > 0 && !m.tempC.isNaN() && m.tempC >= s.opts.stopTempC) ||
@@ -1888,6 +2146,30 @@ class CameraService : LifecycleService(), CameraController {
         }
         synchronized(recordLock) {
             if (session != null) return
+            // 録画の準備（録画の組み方で待つ）は、熱いときは解いて冷えるまで休む（冷えたら頼まれていた通りに準備し直す）
+            val a0 = armed
+            val stopTemp = a0?.stopTempC ?: lastArm?.stopTempC ?: 0.0
+            val armHot = m.thermal >= PowerManager.THERMAL_STATUS_SEVERE || (stopTemp > 0 && !m.tempC.isNaN() && m.tempC >= stopTemp - 3)
+            if (a0 != null && armHot) {
+                AppLog.i("熱いので録画の準備を休みます（${if (m.tempC.isNaN()) "発熱 段階${m.thermal}" else "${fmt1(m.tempC)}度"}）。冷えたら準備し直します")
+                armPaused = "heat"
+                disarmLocked()
+                return
+            }
+            if (a0 == null && armPaused != null) {
+                val cooled = m.thermal < PowerManager.THERMAL_STATUS_MODERATE && (m.tempC.isNaN() || stopTemp <= 0 || m.tempC < stopTemp - 5)
+                val req = lastArm
+                if (cooled && req != null && !cameraIdle && running && !stopping) {
+                    AppLog.i("冷えたので録画の準備をし直します")
+                    armPaused = null
+                    try {
+                        armLocked(req)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "re-arm failed", e)
+                    }
+                }
+                return
+            }
             val a = armed
             if (a == null || !Prefs.preRoll(this)) {
                 bufPaused = null

@@ -12,6 +12,12 @@ object Prefs {
     private const val KEY_STAB = "stabilization"
     private const val KEY_PREROLL = "preRoll"
     private const val KEY_PREROLL_SEC = "preRollSeconds"
+    private const val KEY_STREAM_FPS = "streamFps"
+    private const val KEY_IDLE_CAMERA_OFF = "idleCameraOff"
+    private const val KEY_IDLE_SENSOR_FPS = "idleSensorFps"
+    private const val KEY_EXT_ON_DEMAND = "extensionOnDemand"
+    private const val KEY_STANDBY_OVERLAY_ALWAYS = "standbyOverlayAlways"
+    private const val KEY_STANDBY_STARTS = "standbyStarts"
 
     private fun sp(context: Context) = context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
 
@@ -65,6 +71,58 @@ object Prefs {
 
     fun setPreRollSeconds(context: Context, value: Int) {
         sp(context).edit().putInt(KEY_PREROLL_SEC, value.coerceIn(3, 60)).apply()
+    }
+
+    // ── 負荷を抑える設定（0.1.12）。録画の画質には関わらない ──
+
+    /** メガネへ配信する映像の上限 fps（メガネには 5〜9fps しか送れないので 15 で足りる。30 は以前の動き） */
+    fun streamFps(context: Context): Int = sp(context).getInt(KEY_STREAM_FPS, 15).coerceIn(5, 30)
+
+    fun setStreamFps(context: Context, value: Int) {
+        sp(context).edit().putInt(KEY_STREAM_FPS, value.coerceIn(5, 30)).apply()
+    }
+
+    /** 誰も映像を取りに来なくなったら（20 秒）カメラを閉じる。次の要求で開き直す（1 秒ほど待たせる） */
+    fun idleCameraOff(context: Context): Boolean = sp(context).getBoolean(KEY_IDLE_CAMERA_OFF, true)
+
+    fun setIdleCameraOff(context: Context, value: Boolean) {
+        sp(context).edit().putBoolean(KEY_IDLE_CAMERA_OFF, value).apply()
+    }
+
+    /** 配信＋撮影だけのとき（録画の準備中・録画中ではないとき）はセンサーを 15fps にして ISP の仕事を減らす */
+    fun idleSensorFps(context: Context): Boolean = sp(context).getBoolean(KEY_IDLE_SENSOR_FPS, true)
+
+    fun setIdleSensorFps(context: Context, value: Boolean) {
+        sp(context).edit().putBoolean(KEY_IDLE_SENSOR_FPS, value).apply()
+    }
+
+    /** 静止画の高画質（端末のカメラ拡張）は撮影の前後だけ使い、待機中は通常の組み方にする（拡張は待機中も処理が走って重い） */
+    fun extensionOnDemand(context: Context): Boolean = sp(context).getBoolean(KEY_EXT_ON_DEMAND, true)
+
+    fun setExtensionOnDemand(context: Context, value: Boolean) {
+        sp(context).edit().putBoolean(KEY_EXT_ON_DEMAND, value).apply()
+    }
+
+    /** 待機モードで透明な窓を出し続ける（false なら起動要求のときだけ出す） */
+    fun standbyOverlayAlways(context: Context): Boolean = sp(context).getBoolean(KEY_STANDBY_OVERLAY_ALWAYS, true)
+
+    fun setStandbyOverlayAlways(context: Context, value: Boolean) {
+        sp(context).edit().putBoolean(KEY_STANDBY_OVERLAY_ALWAYS, value).apply()
+    }
+
+    /** 待機サービスが始まった時刻を残す（システムに何度も再起動されていないかを見るため。直近 20 回） */
+    fun noteStandbyStart(context: Context) {
+        val now = System.currentTimeMillis()
+        val list = standbyStarts(context).filter { now - it < 24 * 3600_000L }.takeLast(19) + now
+        sp(context).edit().putString(KEY_STANDBY_STARTS, list.joinToString(",")).apply()
+    }
+
+    private fun standbyStarts(context: Context): List<Long> =
+        sp(context).getString(KEY_STANDBY_STARTS, "")?.split(',')?.mapNotNull { it.toLongOrNull() } ?: emptyList()
+
+    fun standbyStartsWithin(context: Context, ms: Long): Int {
+        val now = System.currentTimeMillis()
+        return standbyStarts(context).count { now - it < ms }
     }
 
     /** 録画の組み方の記憶：向き・画質・静止画の有無ごとに、頼んだ画質が通った手ブレ補正のモード（0〜2） */

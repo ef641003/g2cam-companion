@@ -1,11 +1,13 @@
-name: つなぎ合わせの試験（エミュレーター）
+name: エミュレーターでの試験
 
-# 遡り録画のつなぎ合わせ（Mp4Merger）を、エミュレーターの符号化器で作った本物の MP4 で確かめる
+# 遡り録画のつなぎ合わせ（Mp4Merger）を、エミュレーターの符号化器で作った本物の MP4 で確かめる。
+# メガネ用 JPEG の変換（FrameEncoder）の確認と、以前の作りとの速さ比べも走る（結果は test.log の G2CamBench）
 on:
   push:
     branches: [main]
     paths:
       - 'app/src/main/java/com/ef64nagaoka/g2cam/Mp4Merger.kt'
+      - 'app/src/main/java/com/ef64nagaoka/g2cam/FrameEncoder.kt'
       - 'app/src/androidTest/**'
       - '.github/workflows/merger-test.yml'
   workflow_dispatch:
@@ -51,7 +53,7 @@ jobs:
           target: default
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -camera-front none
           disable-animations: true
-          script: bash -c 'set -o pipefail; gradle --no-daemon connectedDebugAndroidTest 2>&1 | tee -a test.log'
+          script: bash -c 'set -o pipefail; gradle --no-daemon connectedDebugAndroidTest 2>&1 | tee -a test.log; echo "===== G2CamBench =====" | tee -a test.log; adb logcat -d -s G2CamBench:I 2>/dev/null | tee -a test.log'
 
       # 結果を読めるよう、ログと結果を test-log ブランチに置く
       - name: 試験のログを test-log ブランチへ
