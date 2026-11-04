@@ -1,0 +1,18 @@
+<?xml version='1.0' encoding='UTF-8' ?>
+<testsuite name="com.ef64nagaoka.g2cam.FrameEncoderTest" tests="10" failures="0" errors="0" skipped="0" time="10.082" timestamp="2026-11-04T06:35:51" hostname="localhost">
+  <properties>
+    <property name="device" value="emulator-5554 - 11" />
+    <property name="flavor" value="" />
+    <property name="project" value=":app" />
+  </properties>
+  <testcase name="handlesRowPadding" classname="com.ef64nagaoka.g2cam.FrameEncoderTest" time="0.006" />
+  <testcase name="benchmarkAgainstLegacy" classname="com.ef64nagaoka.g2cam.FrameEncoderTest" time="0.269" />
+  <testcase name="producesScaledRotatedJpeg" classname="com.ef64nagaoka.g2cam.FrameEncoderTest" time="0.004" />
+  <testcase name="refusesUnreadableParts" classname="com.ef64nagaoka.g2cam.Mp4MergerTest" time="0.053" />
+  <testcase name="joinsPreviousTailAndCurrentChunk" classname="com.ef64nagaoka.g2cam.Mp4MergerTest" time="4.012" />
+  <testcase name="cutsTheHeadOfASingleChunk" classname="com.ef64nagaoka.g2cam.Mp4MergerTest" time="1.933" />
+  <testcase name="refusesAudioMismatch" classname="com.ef64nagaoka.g2cam.Mp4MergerTest" time="0.753" />
+  <testcase name="validateRejectsTooShort" classname="com.ef64nagaoka.g2cam.Mp4MergerTest" time="0.605" />
+  <testcase name="keepsVideoOnlyFiles" classname="com.ef64nagaoka.g2cam.Mp4MergerTest" time="0.479" />
+  <testcase name="refusesDifferentSizes" classname="com.ef64nagaoka.g2cam.Mp4MergerTest" time="1.23" />
+</testsuite>

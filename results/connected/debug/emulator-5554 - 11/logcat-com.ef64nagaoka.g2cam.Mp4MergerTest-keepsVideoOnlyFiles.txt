@@ -1,0 +1,106 @@
+11-04 06:35:48.796  2315  2335 I TestRunner: started: keepsVideoOnlyFiles(com.ef64nagaoka.g2cam.Mp4MergerTest)
+11-04 06:35:48.798  2315  3145 I OMXClient: IOmx service obtained
+11-04 06:35:48.798   438   771 I OMXMaster: makeComponentInstance(OMX.google.h264.encoder) in android.hardwar process
+11-04 06:35:48.800  2315  3145 I ACodec  : [OMX.google.h264.encoder] using color format 0x13 in place of 0x7f420888
+11-04 06:35:48.800  2315  3145 I ACodec  : setupAVCEncoderParameters with [profile: Baseline] [level: Level41]
+11-04 06:35:48.800  2315  3145 I ACodec  : [OMX.google.h264.encoder] cannot encode color aspects. Ignoring.
+11-04 06:35:48.801  2315  3145 I ACodec  : [OMX.google.h264.encoder] cannot encode HDR static metadata. Ignoring.
+11-04 06:35:48.801  2315  3145 I ACodec  : setupVideoEncoder succeeded
+11-04 06:35:48.801   438   933 E OMXNodeInstance: getConfig(0xf18806a0:google.h264.encoder, ConfigLatency(0x6f800005)) ERROR: Undefined(0x80001001)
+11-04 06:35:48.801   438   933 E OMXNodeInstance: getConfig(0xf18806a0:google.h264.encoder, ConfigAndroidVendorExtension(0x6f100004)) ERROR: Undefined(0x80001001)
+11-04 06:35:48.803   435   890 W ResourceManagerService: Ignoring request to add new resource entry with value <= 0
+11-04 06:35:48.803   438  3146 D SoftAVCEnc: Params width 320 height 240 level 41 colorFormat 0
+11-04 06:35:48.986  2315  2335 D MPEG4Writer: PreAllocation enabled
+11-04 06:35:48.987  2315  2335 D MPEG4Writer: fpathconf _PC_FILESIZEBITS:64
+11-04 06:35:48.987  2315  2335 D MPEG4Writer: File size limit set to 4503599627370495 bytes implicitly
+11-04 06:35:48.987  2315  2335 D MPEG4Writer: MP4WtrCtrlHlpLooper Started
+11-04 06:35:48.987  2315  2335 I MPEG4Writer: limits: 4503599627370495/0 bytes/us, bit rate: -1 bps and the estimated moov size 3192 bytes
+11-04 06:35:48.987  2315  3329 D MPEG4Writer: kWhatNoIOErrorSoFar
+11-04 06:35:48.987  2315  3330 I MPEG4Writer: setStartTimestampUs: 0
+11-04 06:35:48.987  2315  3330 I MPEG4Writer: Earliest track starting time: 0
+11-04 06:35:48.993  2315  2335 D MPEG4Writer: reset()
+11-04 06:35:48.993  2315  2335 D MPEG4Writer: Video track stopping. Stop source
+11-04 06:35:48.993  2315  2335 D MPEG4Writer: Video track source stopping
+11-04 06:35:48.993  2315  2335 D MPEG4Writer: Video track source stopped
+11-04 06:35:48.993  2315  3330 V MediaWriter: Track event err/info msg:101, trackId:1, type:1000,val:-1011
+11-04 06:35:48.993  2315  3330 I MPEG4Writer: Received total/0-length (180/0) buffers and encoded 180 frames. - Video
+11-04 06:35:48.994  2315  2335 D MPEG4Writer: Video track stopped. Status:0. Stop source
+11-04 06:35:48.994  2315  3328 D MPEG4Writer: 0 chunks are written in the last batch
+11-04 06:35:48.994  2315  2335 D MPEG4Writer: WriterThread stopped. Status:0
+11-04 06:35:48.994  2315  2335 I MPEG4Writer: Adjust the moov start time from 0 us -> 0 us
+11-04 06:35:48.994  2315  2335 I MPEG4Writer: MOOV atom was written to the file
+11-04 06:35:48.994  2315  2335 D MPEG4Writer: release()
+11-04 06:35:48.994  2315  2335 D MPEG4Writer: ftruncate mPreAllocateFileEndOffset:126673 mOffset:1539 mMdatEndOffset:124497 diff:2176
+11-04 06:35:48.995  2315  2335 D MPEG4Writer: MP4WtrCtrlHlpLooper stopped
+11-04 06:35:48.995  2315  2335 D MPEG4Writer: Top 5 write durations(microseconds): #1:3 #2:3 #3:4 #4:4 #5:11
+11-04 06:35:48.995  2315  2335 D MPEG4Writer: reset()
+11-04 06:35:48.995  2315  2335 D MPEG4Writer: Video track stopping. Stop source
+11-04 06:35:48.995  2315  2335 E MPEG4Writer: Stop() called but track is not started or stopped
+11-04 06:35:48.996  2315  3332 I OMXClient: IOmx service obtained
+11-04 06:35:48.996   438   771 I OMXMaster: makeComponentInstance(OMX.google.h264.encoder) in android.hardwar process
+11-04 06:35:48.998  2315  3332 I ACodec  : [OMX.google.h264.encoder] using color format 0x13 in place of 0x7f420888
+11-04 06:35:48.998  2315  3332 I ACodec  : setupAVCEncoderParameters with [profile: Baseline] [level: Level41]
+11-04 06:35:48.998  2315  3332 I ACodec  : [OMX.google.h264.encoder] cannot encode color aspects. Ignoring.
+11-04 06:35:48.998  2315  3332 I ACodec  : [OMX.google.h264.encoder] cannot encode HDR static metadata. Ignoring.
+11-04 06:35:48.998  2315  3332 I ACodec  : setupVideoEncoder succeeded
+11-04 06:35:48.998   438   771 E OMXNodeInstance: getConfig(0xf18806a0:google.h264.encoder, ConfigLatency(0x6f800005)) ERROR: Undefined(0x80001001)
+11-04 06:35:48.998   438   771 E OMXNodeInstance: getConfig(0xf18806a0:google.h264.encoder, ConfigAndroidVendorExtension(0x6f100004)) ERROR: Undefined(0x80001001)
+11-04 06:35:48.999   435   890 W ResourceManagerService: Ignoring request to add new resource entry with value <= 0
+11-04 06:35:48.999   438  3333 D SoftAVCEnc: Params width 320 height 240 level 41 colorFormat 0
+11-04 06:35:49.192  2315  2335 D MPEG4Writer: PreAllocation enabled
+11-04 06:35:49.193  2315  2335 D MPEG4Writer: fpathconf _PC_FILESIZEBITS:64
+11-04 06:35:49.193  2315  2335 D MPEG4Writer: File size limit set to 4503599627370495 bytes implicitly
+11-04 06:35:49.193  2315  2335 D MPEG4Writer: MP4WtrCtrlHlpLooper Started
+11-04 06:35:49.193  2315  2335 I MPEG4Writer: limits: 4503599627370495/0 bytes/us, bit rate: -1 bps and the estimated moov size 3192 bytes
+11-04 06:35:49.193  2315  3516 D MPEG4Writer: kWhatNoIOErrorSoFar
+11-04 06:35:49.193  2315  3517 I MPEG4Writer: setStartTimestampUs: 0
+11-04 06:35:49.193  2315  3517 I MPEG4Writer: Earliest track starting time: 0
+11-04 06:35:49.202  2315  2335 D MPEG4Writer: reset()
+11-04 06:35:49.202  2315  2335 D MPEG4Writer: Video track stopping. Stop source
+11-04 06:35:49.202  2315  2335 D MPEG4Writer: Video track source stopping
+11-04 06:35:49.202  2315  2335 D MPEG4Writer: Video track source stopped
+11-04 06:35:49.202  2315  3517 V MediaWriter: Track event err/info msg:101, trackId:1, type:1000,val:-1011
+11-04 06:35:49.202  2315  3517 I MPEG4Writer: Received total/0-length (180/0) buffers and encoded 180 frames. - Video
+11-04 06:35:49.202  2315  2335 D MPEG4Writer: Video track stopped. Status:0. Stop source
+11-04 06:35:49.202  2315  3515 D MPEG4Writer: 0 chunks are written in the last batch
+11-04 06:35:49.202  2315  2335 D MPEG4Writer: WriterThread stopped. Status:0
+11-04 06:35:49.202  2315  2335 I MPEG4Writer: Adjust the moov start time from 0 us -> 0 us
+11-04 06:35:49.202  2315  2335 I MPEG4Writer: MOOV atom was written to the file
+11-04 06:35:49.202  2315  2335 D MPEG4Writer: release()
+11-04 06:35:49.202  2315  2335 D MPEG4Writer: ftruncate mPreAllocateFileEndOffset:126673 mOffset:1539 mMdatEndOffset:124497 diff:2176
+11-04 06:35:49.203  2315  2335 D MPEG4Writer: MP4WtrCtrlHlpLooper stopped
+11-04 06:35:49.203  2315  2335 D MPEG4Writer: Top 5 write durations(microseconds): #1:3 #2:3 #3:3 #4:4 #5:11
+11-04 06:35:49.203  2315  2335 D MPEG4Writer: reset()
+11-04 06:35:49.203  2315  2335 D MPEG4Writer: Video track stopping. Stop source
+11-04 06:35:49.203  2315  2335 E MPEG4Writer: Stop() called but track is not started or stopped
+11-04 06:35:49.217  2315  2335 D MPEG4Writer: PreAllocation enabled
+11-04 06:35:49.217  2315  2335 D MPEG4Writer: fpathconf _PC_FILESIZEBITS:64
+11-04 06:35:49.217  2315  2335 D MPEG4Writer: File size limit set to 4503599627370495 bytes implicitly
+11-04 06:35:49.217  2315  2335 D MPEG4Writer: MP4WtrCtrlHlpLooper Started
+11-04 06:35:49.217  2315  2335 I MPEG4Writer: limits: 4503599627370495/0 bytes/us, bit rate: -1 bps and the estimated moov size 3192 bytes
+11-04 06:35:49.218  2315  3519 D MPEG4Writer: kWhatNoIOErrorSoFar
+11-04 06:35:49.224   433   433 D MediaBufferGroup: creating MemoryDealer
+11-04 06:35:49.225  2315  3520 I MPEG4Writer: setStartTimestampUs: 0
+11-04 06:35:49.225  2315  3520 I MPEG4Writer: Earliest track starting time: 0
+11-04 06:35:49.233   433   433 D MediaBufferGroup: creating MemoryDealer
+11-04 06:35:49.242  2315  2335 D MPEG4Writer: reset()
+11-04 06:35:49.242  2315  2335 D MPEG4Writer: Video track stopping. Stop source
+11-04 06:35:49.242  2315  2335 D MPEG4Writer: Video track source stopping
+11-04 06:35:49.242  2315  2335 D MPEG4Writer: Video track source stopped
+11-04 06:35:49.242  2315  3520 V MediaWriter: Track event err/info msg:101, trackId:1, type:1000,val:-1011
+11-04 06:35:49.242  2315  3520 I MPEG4Writer: Received total/0-length (240/0) buffers and encoded 240 frames. - Video
+11-04 06:35:49.242  2315  2335 D MPEG4Writer: Video track stopped. Status:0. Stop source
+11-04 06:35:49.242  2315  3518 D MPEG4Writer: 0 chunks are written in the last batch
+11-04 06:35:49.242  2315  2335 D MPEG4Writer: WriterThread stopped. Status:0
+11-04 06:35:49.242  2315  2335 I MPEG4Writer: Adjust the moov start time from 0 us -> 0 us
+11-04 06:35:49.242  2315  2335 I MPEG4Writer: MOOV atom was written to the file
+11-04 06:35:49.242  2315  2335 D MPEG4Writer: release()
+11-04 06:35:49.242  2315  2335 D MPEG4Writer: ftruncate mPreAllocateFileEndOffset:168068 mOffset:1787 mMdatEndOffset:165644 diff:2424
+11-04 06:35:49.244  2315  2335 D MPEG4Writer: MP4WtrCtrlHlpLooper stopped
+11-04 06:35:49.244  2315  2335 D MPEG4Writer: Top 5 write durations(microseconds): #1:3 #2:4 #3:5 #4:6 #5:8
+11-04 06:35:49.244  2315  2335 D MPEG4Writer: reset()
+11-04 06:35:49.244  2315  2335 D MPEG4Writer: Video track stopping. Stop source
+11-04 06:35:49.244  2315  2335 E MPEG4Writer: Stop() called but track is not started or stopped
+11-04 06:35:49.250   433   433 D MediaBufferGroup: creating MemoryDealer
+11-04 06:35:49.266   433   433 D MediaBufferGroup: creating MemoryDealer
+11-04 06:35:49.270  2315  2335 I TestRunner: finished: keepsVideoOnlyFiles(com.ef64nagaoka.g2cam.Mp4MergerTest)

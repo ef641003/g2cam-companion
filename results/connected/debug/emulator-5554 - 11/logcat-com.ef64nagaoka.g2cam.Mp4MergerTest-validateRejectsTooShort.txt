@@ -1,0 +1,138 @@
+11-04 06:35:48.177  2315  2335 I TestRunner: started: validateRejectsTooShort(com.ef64nagaoka.g2cam.Mp4MergerTest)
+11-04 06:35:48.180  2315  3074 I OMXClient: IOmx service obtained
+11-04 06:35:48.180   438   933 I OMXMaster: makeComponentInstance(OMX.google.h264.encoder) in android.hardwar process
+11-04 06:35:48.183  2315  3074 I ACodec  : [OMX.google.h264.encoder] using color format 0x13 in place of 0x7f420888
+11-04 06:35:48.183  2315  3074 I ACodec  : setupAVCEncoderParameters with [profile: Baseline] [level: Level41]
+11-04 06:35:48.184  2315  3074 I ACodec  : [OMX.google.h264.encoder] cannot encode color aspects. Ignoring.
+11-04 06:35:48.184  2315  3074 I ACodec  : [OMX.google.h264.encoder] cannot encode HDR static metadata. Ignoring.
+11-04 06:35:48.184  2315  3074 I ACodec  : setupVideoEncoder succeeded
+11-04 06:35:48.184   438   771 E OMXNodeInstance: getConfig(0xf18806a0:google.h264.encoder, ConfigLatency(0x6f800005)) ERROR: Undefined(0x80001001)
+11-04 06:35:48.184   438   771 E OMXNodeInstance: getConfig(0xf18806a0:google.h264.encoder, ConfigAndroidVendorExtension(0x6f100004)) ERROR: Undefined(0x80001001)
+11-04 06:35:48.185   435   890 W ResourceManagerService: Ignoring request to add new resource entry with value <= 0
+11-04 06:35:48.185   438  3075 D SoftAVCEnc: Params width 320 height 240 level 41 colorFormat 0
+11-04 06:35:48.244  2315  3137 D CCodec  : allocate(c2.android.aac.encoder)
+11-04 06:35:48.244   441  1126 V C2Store : in init
+11-04 06:35:48.244   441  1126 V C2Store : loading dll
+11-04 06:35:48.245  2315  3137 I CCodec  : Created component [c2.android.aac.encoder]
+11-04 06:35:48.245  2315  3137 D CCodecConfig: read media type: audio/mp4a-latm
+11-04 06:35:48.246  2315  3137 D ReflectedParamUpdater: extent() != 1 for single value type: algo.buffers.max-count.values
+11-04 06:35:48.246  2315  3137 D ReflectedParamUpdater: extent() != 1 for single value type: output.subscribed-indices.values
+11-04 06:35:48.246  2315  3137 D ReflectedParamUpdater: extent() != 1 for single value type: input.buffers.allocator-ids.values
+11-04 06:35:48.246  2315  3137 D ReflectedParamUpdater: extent() != 1 for single value type: output.buffers.allocator-ids.values
+11-04 06:35:48.246  2315  3137 D ReflectedParamUpdater: extent() != 1 for single value type: algo.buffers.allocator-ids.values
+11-04 06:35:48.247  2315  3137 D ReflectedParamUpdater: extent() != 1 for single value type: output.buffers.pool-ids.values
+11-04 06:35:48.247  2315  3137 D ReflectedParamUpdater: extent() != 1 for single value type: algo.buffers.pool-ids.values
+11-04 06:35:48.247  2315  3137 I CCodecConfig: query failed after returning 9 values (BAD_INDEX)
+11-04 06:35:48.247  2315  3137 D CCodecConfig: c2 config diff is Dict {
+11-04 06:35:48.247  2315  3137 D CCodecConfig:   c2::u32 coded.bitrate.value = 64000
+11-04 06:35:48.247  2315  3137 D CCodecConfig:   c2::u32 coded.pl.level = 0
+11-04 06:35:48.247  2315  3137 D CCodecConfig:   c2::u32 coded.pl.profile = 8192
+11-04 06:35:48.247  2315  3137 D CCodecConfig:   c2::u32 coding.aac-sbr-mode.value = 3
+11-04 06:35:48.247  2315  3137 D CCodecConfig:   c2::u32 input.buffers.max-size.value = 2048
+11-04 06:35:48.247  2315  3137 D CCodecConfig:   c2::u32 input.delay.value = 0
+11-04 06:35:48.247  2315  3137 D CCodecConfig:   string input.media-type.value = "audio/raw"
+11-04 06:35:48.247  2315  3137 D CCodecConfig:   string output.media-type.value = "audio/mp4a-latm"
+11-04 06:35:48.247  2315  3137 D CCodecConfig:   c2::u32 raw.channel-count.value = 1
+11-04 06:35:48.247  2315  3137 D CCodecConfig:   c2::u32 raw.sample-rate.value = 44100
+11-04 06:35:48.247  2315  3137 D CCodecConfig: }
+11-04 06:35:48.248  2315  3137 D CCodec  : [c2.android.aac.encoder] buffers are bound to CCodec for this session
+11-04 06:35:48.248  2315  3137 D CCodecConfig: no c2 equivalents for aac-profile
+11-04 06:35:48.248  2315  3137 D CCodecConfig: no c2 equivalents for flags
+11-04 06:35:48.248  2315  3137 D CCodecConfig: no c2 equivalents for encoder
+11-04 06:35:48.248  2315  3137 W Codec2Client: query -- param skipped: index = 1107298332.
+11-04 06:35:48.248  2315  3137 D CCodec  : setup formats input: AMessage(what = 0x00000000) = {
+11-04 06:35:48.248  2315  3137 D CCodec  :   int32_t aac-sbr-mode = 3
+11-04 06:35:48.248  2315  3137 D CCodec  :   int32_t channel-count = 1
+11-04 06:35:48.248  2315  3137 D CCodec  :   int32_t max-input-size = 16384
+11-04 06:35:48.248  2315  3137 D CCodec  :   string mime = "audio/raw"
+11-04 06:35:48.248  2315  3137 D CCodec  :   int32_t sample-rate = 44100
+11-04 06:35:48.248  2315  3137 D CCodec  : } and output: AMessage(what = 0x00000000) = {
+11-04 06:35:48.248  2315  3137 D CCodec  :   int32_t aac-sbr-mode = 3
+11-04 06:35:48.248  2315  3137 D CCodec  :   int32_t bitrate = 64000
+11-04 06:35:48.248  2315  3137 D CCodec  :   int32_t channel-count = 1
+11-04 06:35:48.248  2315  3137 D CCodec  :   int32_t level = 0
+11-04 06:35:48.248  2315  3137 D CCodec  :   int32_t max-bitrate = 64000
+11-04 06:35:48.248  2315  3137 D CCodec  :   string mime = "audio/mp4a-latm"
+11-04 06:35:48.248  2315  3137 D CCodec  :   int32_t profile = 2
+11-04 06:35:48.248  2315  3137 D CCodec  :   int32_t sample-rate = 44100
+11-04 06:35:48.248  2315  3137 D CCodec  : }
+11-04 06:35:48.249  2315  3137 W Codec2Client: query -- param skipped: index = 1342179345.
+11-04 06:35:48.249  2315  3137 W Codec2Client: query -- param skipped: index = 2415921170.
+11-04 06:35:48.249  2315  3137 E FMQ     : grantorIdx must be less than 3
+11-04 06:35:48.249  2315  3137 E FMQ     : grantorIdx must be less than 3
+11-04 06:35:48.249  2315  3137 D CCodecBufferChannel: [c2.android.aac.encoder#193] Created input block pool with allocatorID 16 => poolID 21 - OK (0)
+11-04 06:35:48.249   441   980 E FMQ     : grantorIdx must be less than 3
+11-04 06:35:48.249   441   980 E FMQ     : grantorIdx must be less than 3
+11-04 06:35:48.249  2315  3137 I CCodecBufferChannel: [c2.android.aac.encoder#193] Created output block pool with allocatorID 16 => poolID 30 - OK
+11-04 06:35:48.249  2315  3137 D CCodecBufferChannel: [c2.android.aac.encoder#193] Configured output block pool ids 30 => OK
+11-04 06:35:48.250   441  3138 D SimpleC2Component: Using output block pool with poolID 30 => got 30 - 0
+11-04 06:35:48.250  2315  3137 E FMQ     : grantorIdx must be less than 3
+11-04 06:35:48.250   441   980 E FMQ     : grantorIdx must be less than 3
+11-04 06:35:48.254   441  3138 E FMQ     : grantorIdx must be less than 3
+11-04 06:35:48.254  2315  2340 E FMQ     : grantorIdx must be less than 3
+11-04 06:35:48.665   507   649 E WifiScoringParams: Invalid frequency(-1), using 5G as default rssi array
+11-04 06:35:48.667   507   649 E WifiHealthMonitor:  Hit PackageManager exception
+11-04 06:35:48.667   507   649 E WifiHealthMonitor: android.content.pm.PackageManager$NameNotFoundException: com.google.android.wifi
+11-04 06:35:48.667   507   649 E WifiHealthMonitor: 	at android.app.ApplicationPackageManager.getPackageInfoAsUser(ApplicationPackageManager.java:206)
+11-04 06:35:48.667   507   649 E WifiHealthMonitor: 	at android.app.ApplicationPackageManager.getPackageInfo(ApplicationPackageManager.java:178)
+11-04 06:35:48.667   507   649 E WifiHealthMonitor: 	at com.android.server.wifi.WifiHealthMonitor.extractCurrentSoftwareBuildInfo(WifiHealthMonitor.java:545)
+11-04 06:35:48.667   507   649 E WifiHealthMonitor: 	at com.android.server.wifi.WifiHealthMonitor.postBootSwBuildCheck(WifiHealthMonitor.java:477)
+11-04 06:35:48.667   507   649 E WifiHealthMonitor: 	at com.android.server.wifi.WifiHealthMonitor.postBootDetectionHandler(WifiHealthMonitor.java:468)
+11-04 06:35:48.667   507   649 E WifiHealthMonitor: 	at com.android.server.wifi.WifiHealthMonitor.access$200(WifiHealthMonitor.java:70)
+11-04 06:35:48.667   507   649 E WifiHealthMonitor: 	at com.android.server.wifi.WifiHealthMonitor$2.onAlarm(WifiHealthMonitor.java:163)
+11-04 06:35:48.667   507   649 E WifiHealthMonitor: 	at android.app.AlarmManager$ListenerWrapper.run(AlarmManager.java:239)
+11-04 06:35:48.667   507   649 E WifiHealthMonitor: 	at android.os.Handler.handleCallback(Handler.java:938)
+11-04 06:35:48.667   507   649 E WifiHealthMonitor: 	at android.os.Handler.dispatchMessage(Handler.java:99)
+11-04 06:35:48.667   507   649 E WifiHealthMonitor: 	at android.os.Looper.loop(Looper.java:223)
+11-04 06:35:48.667   507   649 E WifiHealthMonitor: 	at android.os.HandlerThread.run(HandlerThread.java:67)
+11-04 06:35:48.673   507   649 W system_server: Core platform API violation: Lsun/misc/Unsafe;->allocateInstance(Ljava/lang/Class;)Ljava/lang/Object; from /apex/com.android.wifi/javalib/service-wifi.jar using linking
+11-04 06:35:48.673   507   649 W UnsafeUtil: platform method missing - proto runtime falling back to safer methods: java.lang.NoSuchMethodException: sun.misc.Unsafe.copyMemory [class java.lang.Object, long, class java.lang.Object, long, long]
+11-04 06:35:48.729  2315  2526 D BufferPoolAccessor2.0: bufferpool2 0x7bf5458b93a8 : 0(0 size) total buffers - 0(0 size) used buffers - 0/5 (recycle/alloc) - 4/518 (fetch/transfer)
+11-04 06:35:48.729  2315  2526 D BufferPoolAccessor2.0: evictor expired: 1, evicted: 1
+11-04 06:35:48.768  2315  3137 D CCodecBufferChannel: [c2.android.aac.encoder#193] MediaCodec discarded an unknown buffer
+11-04 06:35:48.768  2315  3137 I chatty  : uid=10130(com.ef64nagaoka.g2cam) MediaCodec_loop identical 1 line
+11-04 06:35:48.768  2315  3137 D CCodecBufferChannel: [c2.android.aac.encoder#193] MediaCodec discarded an unknown buffer
+11-04 06:35:48.769  2315  3137 I hw-BpHwBinder: onLastStrongRef automatically unlinking death recipients
+11-04 06:35:48.769   441   980 I hw-BpHwBinder: onLastStrongRef automatically unlinking death recipients
+11-04 06:35:48.770   441   980 V C2Store : in ~ComponentModule
+11-04 06:35:48.770   441   980 V C2Store : unloading dll
+11-04 06:35:48.771  2315  2335 D MPEG4Writer: PreAllocation enabled
+11-04 06:35:48.771  2315  2335 D MPEG4Writer: fpathconf _PC_FILESIZEBITS:64
+11-04 06:35:48.771  2315  2335 D MPEG4Writer: File size limit set to 4503599627370495 bytes implicitly
+11-04 06:35:48.771  2315  2335 D MPEG4Writer: MP4WtrCtrlHlpLooper Started
+11-04 06:35:48.771  2315  2335 I MPEG4Writer: limits: 4503599627370495/0 bytes/us, bit rate: -1 bps and the estimated moov size 3192 bytes
+11-04 06:35:48.772  2315  3141 D MPEG4Writer: kWhatNoIOErrorSoFar
+11-04 06:35:48.772  2315  3142 I MPEG4Writer: setStartTimestampUs: 0
+11-04 06:35:48.772  2315  3142 I MPEG4Writer: Earliest track starting time: 0
+11-04 06:35:48.772  2315  3143 I MPEG4Writer: setStartTimestampUs: 0
+11-04 06:35:48.781  2315  2335 D MPEG4Writer: reset()
+11-04 06:35:48.781  2315  2335 D MPEG4Writer: Video track stopping. Stop source
+11-04 06:35:48.781  2315  2335 D MPEG4Writer: Video track source stopping
+11-04 06:35:48.781  2315  2335 D MPEG4Writer: Video track source stopped
+11-04 06:35:48.781  2315  3142 V MediaWriter: Track event err/info msg:101, trackId:1, type:1000,val:-1011
+11-04 06:35:48.781  2315  3142 I MPEG4Writer: Received total/0-length (60/0) buffers and encoded 60 frames. - Video
+11-04 06:35:48.781  2315  3143 V MediaWriter: Track event err/info msg:101, trackId:2, type:1000,val:-1011
+11-04 06:35:48.781  2315  3143 I MPEG4Writer: Received total/0-length (86/0) buffers and encoded 86 frames. - Audio
+11-04 06:35:48.781  2315  3143 I MPEG4Writer: Audio track drift time: 0 us
+11-04 06:35:48.781  2315  2335 D MPEG4Writer: Video track stopped. Status:0. Stop source
+11-04 06:35:48.781  2315  2335 D MPEG4Writer: Audio track stopping. Stop source
+11-04 06:35:48.781  2315  2335 D MPEG4Writer: Audio track source stopping
+11-04 06:35:48.781  2315  2335 D MPEG4Writer: Audio track source stopped
+11-04 06:35:48.781  2315  2335 D MPEG4Writer: Audio track stopped. Status:0. Stop source
+11-04 06:35:48.781  2315  2335 D MPEG4Writer: Duration from tracks range is [1996915, 1999999] us
+11-04 06:35:48.781  2315  3140 D MPEG4Writer: 0 chunks are written in the last batch
+11-04 06:35:48.781  2315  2335 D MPEG4Writer: WriterThread stopped. Status:0
+11-04 06:35:48.781  2315  2335 I MPEG4Writer: Adjust the moov start time from 0 us -> 0 us
+11-04 06:35:48.781  2315  2335 I MPEG4Writer: MOOV atom was written to the file
+11-04 06:35:48.781  2315  2335 D MPEG4Writer: release()
+11-04 06:35:48.781  2315  2335 D MPEG4Writer: ftruncate mPreAllocateFileEndOffset:60545 mOffset:1866 mMdatEndOffset:57689 diff:2856
+11-04 06:35:48.782  2315  2335 D MPEG4Writer: MP4WtrCtrlHlpLooper stopped
+11-04 06:35:48.782  2315  2335 D MPEG4Writer: Top 5 write durations(microseconds): #1:3 #2:4 #3:5 #4:7 #5:17
+11-04 06:35:48.782  2315  2335 D MPEG4Writer: reset()
+11-04 06:35:48.782  2315  2335 D MPEG4Writer: Video track stopping. Stop source
+11-04 06:35:48.782  2315  2335 E MPEG4Writer: Stop() called but track is not started or stopped
+11-04 06:35:48.782  2315  2335 D MPEG4Writer: Audio track stopping. Stop source
+11-04 06:35:48.782  2315  2335 E MPEG4Writer: Stop() called but track is not started or stopped
+11-04 06:35:48.788   433   433 D MediaBufferGroup: creating MemoryDealer
+11-04 06:35:48.794   433  2218 D MediaBufferGroup: creating MemoryDealer
+11-04 06:35:48.794  2315  2335 I TestRunner: finished: validateRejectsTooShort(com.ef64nagaoka.g2cam.Mp4MergerTest)

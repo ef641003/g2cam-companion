@@ -1,0 +1,34 @@
+INFO: Constructing runner from config.
+INFO: Configuring Android Instrumentation driver: android_instrumentation_runtime {
+  instrumentation_info {
+    app_package: "com.ef64nagaoka.g2cam"
+    test_package: "com.ef64nagaoka.g2cam.test"
+    test_runner_class: "androidx.test.runner.AndroidJUnitRunner"
+  }
+  instrumentation_args {
+    args_map {
+      key: "additionalTestOutputDir"
+      value: "/sdcard/Android/media/com.ef64nagaoka.g2cam/additional_test_output"
+    }
+  }
+}
+am_instrument_timeout: 31536000
+
+INFO: No installables found in test fixture. Nothing to install.
+INFO: Installing [/home/runner/work/g2cam-companion/g2cam-companion/app/build/outputs/apk/debug/app-debug.apk] on device emulator-5554.
+INFO: Installing [/home/runner/work/g2cam-companion/g2cam-companion/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk] on device emulator-5554.
+INFO: Start logcat streaming.
+INFO: Running Android Instrumentation driver.
+INFO: Stop logcat streaming.
+INFO: Uninstalling com.ef64nagaoka.g2cam for device emulator-5554.
+INFO: Uninstalling com.ef64nagaoka.g2cam.test for device emulator-5554.
+INFO: Execute com.ef64nagaoka.g2cam.FrameEncoderTest.handlesRowPadding: PASSED
+INFO: Execute com.ef64nagaoka.g2cam.FrameEncoderTest.benchmarkAgainstLegacy: PASSED
+INFO: Execute com.ef64nagaoka.g2cam.FrameEncoderTest.producesScaledRotatedJpeg: PASSED
+INFO: Execute com.ef64nagaoka.g2cam.Mp4MergerTest.refusesUnreadableParts: PASSED
+INFO: Execute com.ef64nagaoka.g2cam.Mp4MergerTest.joinsPreviousTailAndCurrentChunk: PASSED
+INFO: Execute com.ef64nagaoka.g2cam.Mp4MergerTest.cutsTheHeadOfASingleChunk: PASSED
+INFO: Execute com.ef64nagaoka.g2cam.Mp4MergerTest.refusesAudioMismatch: PASSED
+INFO: Execute com.ef64nagaoka.g2cam.Mp4MergerTest.validateRejectsTooShort: PASSED
+INFO: Execute com.ef64nagaoka.g2cam.Mp4MergerTest.keepsVideoOnlyFiles: PASSED
+INFO: Execute com.ef64nagaoka.g2cam.Mp4MergerTest.refusesDifferentSizes: PASSED
