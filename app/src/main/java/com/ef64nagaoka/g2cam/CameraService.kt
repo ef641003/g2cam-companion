@@ -67,6 +67,7 @@ import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
+import kotlin.math.abs
 import kotlin.math.max
 
 /**
@@ -111,6 +112,21 @@ class CameraService : LifecycleService(), CameraController {
         private const val IDLE_CAMERA_MS = 20_000L
         /** 撮影のあと、静止画の拡張つきの組み方を保っておく時間 */
         private const val EXTENSION_KEEP_MS = 60_000L
+        /** メガネ用 JPEG の長辺 */
+        private const val FRAME_LONG = 320
+        /** 2 画面のとき解析を大きくする（右は一番広いレンズからの切り出しなので、画素が要る） */
+        private val DUAL_ANALYSIS_SIZE = Size(1280, 960)
+        private val NORMAL_ANALYSIS_SIZE = Size(640, 480)
+        /** カメラの倍率を変えた直後は前の倍率の絵が少し来るので、2 画面ではその間を捨てる */
+        private const val ZOOM_SETTLE_MS = 250L
+        /** 左（全体）を作る最短の間隔。メガネでは左は 1〜2 秒ごとにしか送らない */
+        private const val OVERVIEW_INTERVAL_MS = 300L
+        /** 2 画面の要求が途絶えてから、普通（カメラを選んだ倍率に）に戻すまで */
+        private const val DUAL_IDLE_MS = 4_000L
+        /** 2 画面で撮影するとき、光学ズームに切り替えてから撮るまで待つ（レンズの切替・露出・ピント） */
+        private const val OPTICAL_SETTLE_MS = 400L
+        /** 撮影のあと光学ズームのままにしておく時間（連写で行き来しないように） */
+        private const val OPTICAL_KEEP_MS = 1_500L
 
         @Volatile var running = false
         @Volatile var lastError: String? = null
@@ -147,8 +163,30 @@ class CameraService : LifecycleService(), CameraController {
         }
     }
 
+    /** カメラに実際に掛けている倍率 */
     @Volatile private var zoomNow = 1f
-    override val zoom: Float get() = zoomNow
+    /** 利用者が選んだ倍率。2 画面のときは右の画角（カメラ自体は一番広いレンズのまま、右は切り出し） */
+    @Volatile private var wantZoom = 1f
+    override val zoom: Float get() = wantZoom
+    /** 束ねたカメラの一番広い倍率（解析スレッドから読むので控えておく） */
+    @Volatile private var camMinZoom = 1f
+    /** 直近に頼んだカメラのズーム（録画・撮影の前に、効くまで待つ） */
+    @Volatile private var zoomFuture: java.util.concurrent.Future<*>? = null
+    @Volatile private var zoomChangedAt = 0L
+
+    // ── 2 画面（左＝一番広い画角の全体、右＝選んだ倍率） ──
+    /** 2 画面で配信している（G2 カメラが /frame?dual=1 や /overview を取りに来ている間） */
+    @Volatile private var dualActive = false
+    @Volatile private var lastDualAt = 0L
+    @Volatile private var lastOverviewRequestAt = 0L
+    /** 撮影のために光学ズームにしておく期限（この間は 2 画面でも一番広いレンズに戻さない） */
+    @Volatile private var opticalHoldUntil = 0L
+    private var lastOverviewAt = 0L
+    private val overviewLock = ReentrantLock()
+    private val overviewArrived = overviewLock.newCondition()
+    @Volatile private var latestOverview: Overview? = null
+    private var overviewSeq = System.currentTimeMillis()
+    override val dualActiveNow: Boolean get() = dualActive
     override val zoomMin: Float get() = camera?.cameraInfo?.zoomState?.value?.minZoomRatio ?: 1f
     override val zoomMax: Float get() = camera?.cameraInfo?.zoomState?.value?.maxZoomRatio ?: 1f
 
@@ -346,7 +384,8 @@ class CameraService : LifecycleService(), CameraController {
     private fun buildDiag(): String {
         val a = armed
         val ready = if (a != null) "準備済み（${a.quality} ${a.resolution.ifEmpty { "解像度不明" }}${if (a.still) "・撮影あり" else ""}）" else if (armPaused != null) "休止中（高温）" else "なし"
-        return "構成=${if (cameraIdle) "カメラを閉じている（待機）" else boundLabel}・静止画の拡張=$extensionLabel・手ブレ補正=$stabLabel・録画の解像度=$recordResLabel・録画の準備=$ready・保存先=${Storage.describe(this)}" +
+        val dual = if (dualActive) "・2画面=オン（カメラ x${fmt1(zoomNow.toDouble())}・右は x${fmt1(wantZoom.toDouble())} 相当）" else ""
+        return "構成=${if (cameraIdle) "カメラを閉じている（待機）" else boundLabel}$dual・静止画の拡張=$extensionLabel・手ブレ補正=$stabLabel・録画の解像度=$recordResLabel・録画の準備=$ready・保存先=${Storage.describe(this)}" +
             (if (bindNotes.isNotEmpty()) "・束ね直しの失敗=$bindNotes" else "")
     }
 
@@ -375,6 +414,8 @@ class CameraService : LifecycleService(), CameraController {
                 shutdownGracefully(cancellable = true)
                 return
             }
+            // 2 画面の要求が途絶えた：普通に戻す（カメラを選んだ倍率に）
+            if (dualActive && SystemClock.elapsedRealtime() - lastDualAt > DUAL_IDLE_MS) setDual(false, "要求が途絶えた")
             // 誰も使っていない：カメラを閉じる（サービスは残す。次の要求で開き直す）
             if (!cameraIdle && !reopening && camera != null && session == null && armed == null && bufCur == null && !stopping &&
                 clientSeen && idle > IDLE_CAMERA_MS && Prefs.idleCameraOff(this@CameraService)
@@ -987,7 +1028,11 @@ class CameraService : LifecycleService(), CameraController {
                 .setResolutionSelector(
                     ResolutionSelector.Builder()
                         .setResolutionStrategy(
-                            ResolutionStrategy(Size(640, 480), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER),
+                            // 2 画面（録画の組み方でないとき）は大きめに取る。右を一番広いレンズから切り出すため
+                            ResolutionStrategy(
+                                if (dualActive && spec == null) DUAL_ANALYSIS_SIZE else NORMAL_ANALYSIS_SIZE,
+                                ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER,
+                            ),
                         )
                         .build(),
                 )
@@ -1098,14 +1143,23 @@ class CameraService : LifecycleService(), CameraController {
             videoCapture = if (withVideo) video else null
             if (imageAnalysis == null) frameLock.withLock { latestFrame = null }
             lastError = null
-            // ズームは束ね直すと 1 に戻るので、直前の倍率を掛け直す
-            if (zoomNow != 1f) {
-                try {
-                    bound.cameraControl.setZoomRatio(zoomNow)
-                } catch (e: Exception) {
-                    Log.w(TAG, "zoom restore failed", e)
-                }
+            // ズームは束ね直すと 1 に戻るので掛け直す（2 画面で録画の組み方でなければ一番広いレンズ、ほかは選んだ倍率）
+            camMinZoom = bound.cameraInfo.zoomState.value?.minZoomRatio ?: 1f
+            zoomNow = 1f
+            zoomChangedAt = SystemClock.elapsedRealtime()
+            try {
+                applyCameraZoom()
+            } catch (e: Exception) {
+                Log.w(TAG, "zoom restore failed", e)
             }
+            // 束ねた直後はズームの範囲がまだ読めない端末がある。少し待って読み直し、掛け直す
+            mainHandler.postDelayed({
+                val cam = camera
+                if (cam === bound) {
+                    cam.cameraInfo.zoomState.value?.minZoomRatio?.let { camMinZoom = it }
+                    applyCameraZoom()
+                }
+            }, 600)
         } catch (e: Exception) {
             lastError = "カメラを開始できません: ${e.message}"
             Log.e(TAG, "bindCamera failed", e)
@@ -1126,24 +1180,51 @@ class CameraService : LifecycleService(), CameraController {
      * 解析フレーム → 長辺 320px の JPEG にして最新として保持する。
      * 誰も取りに来ていない間（G2 アプリを閉じている・映像を止めている）は変換しない。
      * 配信の上限 fps（設定。既定 15）を超える分は捨てる。Bitmap は使い回す（FrameEncoder）
+     *
+     * 2 画面のときは、カメラを一番広いレンズにしたまま
+     *  - 右（/frame）：選んだ倍率になるよう中央を切り出す
+     *  - 左（/overview）：全体。数百 ms に 1 枚だけ作る
+     * 録画・撮影で光学ズームにしている間は、右は全体、左は作らない（G2 側は最後の左を出したまま）。
      */
     private fun handleFrame(image: ImageProxy) {
         try {
             val now = SystemClock.elapsedRealtime()
             countFps(now, camera = true, produced = false)
-            if (now - lastFrameRequestAt > FRAME_DEMAND_MS) return
-            if (now - lastFrameAt < streamIntervalMs) return
-            lastFrameAt = now
+            val wantRight = now - lastFrameRequestAt <= FRAME_DEMAND_MS
+            val dual = dualActive
+            val wantOverview = dual && now - lastOverviewRequestAt <= FRAME_DEMAND_MS
+            if (!wantRight && !wantOverview) return
+            // カメラの倍率を変えた直後は、まだ前の倍率の絵が来る（切り出しの大きさが合わない）
+            if (dual && now - zoomChangedAt < ZOOM_SETTLE_MS) return
+            val camZ = zoomNow
+            val doRight = wantRight && now - lastFrameAt >= streamIntervalMs
+            val doOverview = wantOverview && abs(camZ - camMinZoom) < 0.01f && now - lastOverviewAt >= OVERVIEW_INTERVAL_MS
+            if (!doRight && !doOverview) return
 
             val plane = image.planes[0]
-            val bytes = frameEncoder.encode(image.width, image.height, plane.buffer, plane.rowStride, plane.pixelStride, image.imageInfo.rotationDegrees)
-            frameW = frameEncoder.outWidth
-            frameH = frameEncoder.outHeight
-            countFps(now, camera = false, produced = true)
-            frameLock.withLock {
-                frameSeq += 1
-                latestFrame = Frame(frameSeq, bytes)
-                frameArrived.signalAll()
+            val rot = image.imageInfo.rotationDegrees
+            frameEncoder.load(image.width, image.height, plane.buffer, plane.rowStride, plane.pixelStride)
+            if (doRight) {
+                lastFrameAt = now
+                val crop = if (dual) wantZoom / camZ else 1f
+                val bytes = frameEncoder.render(rot, crop, FRAME_LONG)
+                frameW = frameEncoder.outWidth
+                frameH = frameEncoder.outHeight
+                countFps(now, camera = false, produced = true)
+                frameLock.withLock {
+                    frameSeq += 1
+                    latestFrame = Frame(frameSeq, bytes)
+                    frameArrived.signalAll()
+                }
+            }
+            if (doOverview) {
+                lastOverviewAt = now
+                val bytes = frameEncoder.render(rot, 1f, FRAME_LONG)
+                overviewLock.withLock {
+                    overviewSeq += 1
+                    latestOverview = Overview(overviewSeq, bytes, camZ, now)
+                    overviewArrived.signalAll()
+                }
             }
         } catch (e: Exception) {
             Log.w(TAG, "frame failed", e)
@@ -1170,8 +1251,9 @@ class CameraService : LifecycleService(), CameraController {
         }
     }
 
-    override fun nextFrame(afterSeq: Long, waitMs: Long): Frame? {
+    override fun nextFrame(afterSeq: Long, waitMs: Long, dual: Boolean): Frame? {
         lastFrameRequestAt = SystemClock.elapsedRealtime()
+        noteDual(dual)
         if (cameraIdle) wakeCamera("映像")
         // 開き直し・起動の直後で 1 枚も無いときは、最初の 1 枚を長めに待つ（G2 アプリに 503 を返して取り直させない）
         val wait = if (latestFrame == null && (reopening || cameraIdle || camera != null)) maxOf(waitMs, 1500L) else waitMs
@@ -1190,6 +1272,86 @@ class CameraService : LifecycleService(), CameraController {
                 if (remainNs <= 0L) return null
                 remainNs = frameArrived.awaitNanos(remainNs)
             }
+        }
+    }
+
+    override fun nextOverview(afterSeq: Long, waitMs: Long): Overview? {
+        lastOverviewRequestAt = SystemClock.elapsedRealtime()
+        noteDual(true)
+        if (cameraIdle) wakeCamera("2 画面")
+        var remainNs = TimeUnit.MILLISECONDS.toNanos(waitMs)
+        overviewLock.withLock {
+            while (true) {
+                val o = latestOverview
+                if (o != null && o.seq > afterSeq) return o
+                if (remainNs <= 0L) return null
+                remainNs = overviewArrived.awaitNanos(remainNs)
+            }
+        }
+    }
+
+    /** /frame・/overview が来るたびに：2 画面の要求なら入り、普通の要求が来たら（しばらく 2 画面の要求が無ければ）出る */
+    private fun noteDual(dual: Boolean) {
+        val now = SystemClock.elapsedRealtime()
+        if (dual) {
+            lastDualAt = now
+            if (!dualActive) setDual(true, "G2 カメラが 2 画面を求めた")
+        } else if (dualActive && now - lastDualAt > 1_000L) {
+            setDual(false, "普通の映像の要求が来た")
+        }
+    }
+
+    /**
+     * 2 画面に入る・出る。解析の大きさが変わるので、録画していなければ束ね直す（1 秒ほど）。
+     * 録画中・録画の準備中は束ね直さない（録画の組み方のまま。終われば afterSessionLocked が束ね直す）
+     */
+    private fun setDual(on: Boolean, why: String) {
+        if (dualActive == on) return
+        dualActive = on
+        if (!on) overviewLock.withLock { latestOverview = null }
+        AppLog.i(if (on) "2 画面にします（$why）。カメラは一番広いレンズのまま、右は切り出し" else "2 画面をやめます（$why）")
+        postWork {
+            synchronized(recordLock) {
+                if (session == null && armed == null && bufCur == null && !cameraIdle && camera != null && running && !stopping) {
+                    try {
+                        rebindAndWait(null)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "rebind (dual) failed", e)
+                        applyCameraZoom()
+                    }
+                } else {
+                    applyCameraZoom()
+                }
+            }
+        }
+    }
+
+    /** カメラに掛ける倍率：2 画面で、録画の組み方でも撮影の直前でもなければ一番広いレンズ。ほかは選んだ倍率 */
+    private fun cameraZoomTarget(): Float {
+        val st = camera?.cameraInfo?.zoomState?.value
+        val min = st?.minZoomRatio ?: 1f
+        val max = st?.maxZoomRatio ?: 1f
+        val want = wantZoom.coerceIn(min, max)
+        val wide = dualActive && videoCapture == null && SystemClock.elapsedRealtime() >= opticalHoldUntil
+        return if (wide) min else want
+    }
+
+    /** カメラの倍率を cameraZoomTarget に合わせる（変わるときだけ。結果は待たない） */
+    private fun applyCameraZoom() {
+        val cam = camera ?: return
+        val t = cameraZoomTarget()
+        if (abs(t - zoomNow) < 0.001f) return
+        zoomFuture = cam.cameraControl.setZoomRatio(t)
+        zoomNow = t
+        zoomChangedAt = SystemClock.elapsedRealtime()
+    }
+
+    /** 直近のズームが効くまで待つ（最大 1 秒） */
+    private fun awaitZoom() {
+        try {
+            zoomFuture?.get(1, TimeUnit.SECONDS)
+        } catch (e: Exception) {
+            // 次のズームで取り消された・時間切れ。撮影・録画はそのまま進める
         }
     }
 
@@ -1213,12 +1375,13 @@ class CameraService : LifecycleService(), CameraController {
 
     override fun setZoom(zoom: Double): Float {
         if (cameraIdle) wakeCamera("ズーム")
-        val cam = camera ?: return zoomNow
+        val cam = camera ?: return wantZoom
         val state = cam.cameraInfo.zoomState.value
         val target = if (state != null) zoom.toFloat().coerceIn(state.minZoomRatio, state.maxZoomRatio) else 1f
-        // 結果は待たない（ズーム中も映像は流れ続ける）。1 未満なら端末が超広角に、大きければ望遠に切り替える
-        cam.cameraControl.setZoomRatio(target)
-        zoomNow = target
+        // 結果は待たない（ズーム中も映像は流れ続ける）。1 未満なら端末が超広角に、大きければ望遠に切り替える。
+        // 2 画面のときはカメラは一番広いレンズのまま、右の切り出しの大きさだけが変わる
+        wantZoom = target
+        applyCameraZoom()
         return target
     }
 
@@ -1235,6 +1398,8 @@ class CameraService : LifecycleService(), CameraController {
             }
             facingValue = next
             zoomNow = 1f
+            wantZoom = 1f
+            overviewLock.withLock { latestOverview = null }
             frameLock.withLock { latestFrame = null }
             // 切り替えが済んでから返す（直後にズーム範囲を読むため）。録画の準備をしていたなら、新しいカメラで準備し直す
             val a = armed
@@ -1257,6 +1422,20 @@ class CameraService : LifecycleService(), CameraController {
 
     override fun capture(): ByteArray = synchronized(captureLock) {
         lastCaptureAt = SystemClock.elapsedRealtime()
+        // 2 画面：写真は選んだ倍率の光学ズームで撮る（一番広いレンズからの切り出しにはしない）。撮り終えるまで戻さない
+        val optical = dualActive
+        if (optical) opticalHoldUntil = Long.MAX_VALUE
+        try {
+            captureInner(optical)
+        } finally {
+            if (optical) {
+                opticalHoldUntil = SystemClock.elapsedRealtime() + OPTICAL_KEEP_MS
+                mainHandler.postDelayed({ applyCameraZoom() }, OPTICAL_KEEP_MS + 100)
+            }
+        }
+    }
+
+    private fun captureInner(optical: Boolean): ByteArray {
         synchronized(recordLock) {
             if (session == null) {
                 if (cameraIdle) ensureCameraLocked()
@@ -1288,6 +1467,14 @@ class CameraService : LifecycleService(), CameraController {
         }
         val cap = imageCapture
             ?: throw IllegalStateException(if (session != null) "この端末では録画中に撮影できません" else "カメラが起動していません")
+        if (optical && session == null) {
+            val before = zoomNow
+            applyCameraZoom()
+            if (abs(before - zoomNow) > 0.001f) {
+                awaitZoom()
+                Thread.sleep(OPTICAL_SETTLE_MS)
+            }
+        }
 
         // いったんメモリに受けて、すぐ保存先（選んだフォルダ or 写真アプリ）へ書く。読み戻しはしない
         val buffer = ByteArrayOutputStream(4 * 1024 * 1024)
@@ -1315,7 +1502,7 @@ class CameraService : LifecycleService(), CameraController {
             lastError = "写真を保存できません（保存先を確認してください）"
         }
         photosTaken++
-        bytes
+        return bytes
     }
 
     // ── 録画：組み方 ──
@@ -1863,6 +2050,8 @@ class CameraService : LifecycleService(), CameraController {
                 stopBufferLocked()
                 val resolution = armedNow?.resolution ?: bindForRecordingLocked(o.quality, o.still)
                 val vc = videoCapture ?: throw IllegalStateException("録画を開始できません（構成=$boundLabel）")
+                // 2 画面だったときは一番広いレンズから選んだ倍率に戻した直後。効いてから録り始める
+                if (dualActive) awaitZoom()
                 val rec = newDestinationRec(name, withAudio)
                 try {
                     startRecLocked(vc, rec)

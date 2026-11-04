@@ -17,7 +17,8 @@ import kotlin.math.roundToInt
  */
 class FrameEncoder(private val maxLong: Int = 320, private val quality: Int = 70) {
     private var src: Bitmap? = null
-    private var out: Bitmap? = null
+    /** 出力の Bitmap（大きさごと。2 画面では全体と切り出しで 2 つ） */
+    private val outs = HashMap<Long, Bitmap>()
     private var tight: ByteBuffer? = null
     private val stream = ByteArrayOutputStream(32 * 1024)
     private val matrix = Matrix()
@@ -35,6 +36,16 @@ class FrameEncoder(private val maxLong: Int = 320, private val quality: Int = 70
      * @param rotationDegrees 端末の向きに合わせて回す角度（0/90/180/270）
      */
     fun encode(width: Int, height: Int, rgba: ByteBuffer, rowStride: Int, pixelStride: Int, rotationDegrees: Int): ByteArray {
+        load(width, height, rgba, rowStride, pixelStride)
+        return render(rotationDegrees, 1f, maxLong)
+    }
+
+    /** 元の幅・高さ（load したもの） */
+    private var srcW = 0
+    private var srcH = 0
+
+    /** 解析フレームを手元の Bitmap に写す（このあと render を何回でも呼べる） */
+    fun load(width: Int, height: Int, rgba: ByteBuffer, rowStride: Int, pixelStride: Int) {
         val s = src?.takeIf { it.width == width && it.height == height }
             ?: Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also {
                 src?.recycle()
@@ -67,17 +78,34 @@ class FrameEncoder(private val maxLong: Int = 320, private val quality: Int = 70
             t.rewind()
             s.copyPixelsFromBuffer(t)
         }
+        srcW = width
+        srcH = height
+    }
 
+    /**
+     * load したフレームを回して、中央を crop 分の 1 に切り出し（1 で全体）、長辺 longSide の JPEG にする。
+     * 2 画面のときは、同じフレームから「全体（左）」と「切り出し（右）」を作る。
+     */
+    fun render(rotationDegrees: Int, crop: Float, longSide: Int): ByteArray {
+        val s = src ?: throw IllegalStateException("load が先")
+        val width = srcW
+        val height = srcH
+        val k = if (crop.isNaN() || crop < 1f) 1f else crop
+        val cw = width / k
+        val ch = height / k
         val rot = ((rotationDegrees % 360) + 360) % 360
         val swap = rot == 90 || rot == 270
-        val scale = maxLong.toFloat() / max(width, height)
-        val ow = max(1, ((if (swap) height else width) * scale).roundToInt())
-        val oh = max(1, ((if (swap) width else height) * scale).roundToInt())
-        val o = out?.takeIf { it.width == ow && it.height == oh }
-            ?: Bitmap.createBitmap(ow, oh, Bitmap.Config.ARGB_8888).also {
-                out?.recycle()
-                out = it
+        val scale = longSide.toFloat() / max(cw, ch)
+        val ow = max(1, ((if (swap) ch else cw) * scale).roundToInt())
+        val oh = max(1, ((if (swap) cw else ch) * scale).roundToInt())
+        val key = (ow.toLong() shl 20) or oh.toLong()
+        val o = outs[key] ?: Bitmap.createBitmap(ow, oh, Bitmap.Config.ARGB_8888).also {
+            if (outs.size >= 4) {
+                outs.values.forEach { b -> b.recycle() }
+                outs.clear()
             }
+            outs[key] = it
+        }
         matrix.reset()
         matrix.postTranslate(-width / 2f, -height / 2f)
         matrix.postRotate(rot.toFloat())
@@ -94,9 +122,9 @@ class FrameEncoder(private val maxLong: Int = 320, private val quality: Int = 70
 
     fun release() {
         src?.recycle()
-        out?.recycle()
+        outs.values.forEach { it.recycle() }
+        outs.clear()
         src = null
-        out = null
         tight = null
     }
 }

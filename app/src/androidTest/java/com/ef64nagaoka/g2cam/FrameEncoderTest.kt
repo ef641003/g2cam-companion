@@ -74,6 +74,34 @@ class FrameEncoderTest {
     }
 
     @Test
+    fun cropsCenterForDualView() {
+        // 2 画面：同じフレームから全体（左）と中央 1/4 の切り出し（右）を作る。どちらも長辺 320
+        val enc = FrameEncoder()
+        val w = 1280
+        val h = 960
+        enc.load(w, h, fakeFrame(w, h, 0), w * 4, 4)
+        val fullBytes = enc.render(0, 1f, 320)
+        val full = BitmapFactory.decodeByteArray(fullBytes, 0, fullBytes.size)
+        val cropBytes = enc.render(0, 4f, 320)
+        val crop = BitmapFactory.decodeByteArray(cropBytes, 0, cropBytes.size)
+        assertEquals(320, full.width)
+        assertEquals(240, full.height)
+        assertEquals(320, crop.width)
+        assertEquals(240, crop.height)
+        // 切り出しの左上は元の (480, 360) あたり：赤 = 480 and 255 = 224、緑 = 360 and 255 = 104
+        val px = crop.getPixel(1, 1)
+        val r = (px shr 16) and 0xFF
+        val g = (px shr 8) and 0xFF
+        assertTrue("crop pixel r=$r g=$g", kotlin.math.abs(r - 224) < 30 && kotlin.math.abs(g - 104) < 30)
+        // 回転つきの切り出しも縦長になる
+        val rotBytes = enc.render(90, 2f, 320)
+        val rb = BitmapFactory.decodeByteArray(rotBytes, 0, rotBytes.size)
+        assertEquals(240, rb.width)
+        assertEquals(320, rb.height)
+        enc.release()
+    }
+
+    @Test
     fun handlesRowPadding() {
         // 行の間に 64 バイトの余白がある画像でも同じ絵になる
         val w = 320
