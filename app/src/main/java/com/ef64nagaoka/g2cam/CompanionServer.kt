@@ -14,12 +14,6 @@ import java.io.InputStream
 /** プレビュー用の 1 フレーム。seq は増えていく通し番号 */
 class Frame(val seq: Long, val bytes: ByteArray)
 
-/**
- * 2 画面の左（一番広い画角の全体）。zoom はこの絵を撮ったときのカメラの倍率。
- * 右（選んだ倍率）がこの絵のどこかは、中央の zoom / 選んだ倍率 の大きさの枠（G2 カメラが描く）
- */
-class Overview(val seq: Long, val bytes: ByteArray, val zoom: Float, val at: Long)
-
 /** いまは応じられない（書き出し中など）。503 で返し、G2 アプリにあとでやり直してもらう */
 class BusyException(message: String) : Exception(message)
 
@@ -128,17 +122,8 @@ interface CameraController {
     /** まだ 1 枚もフレームを受け取っていないとき false */
     val hasFrame: Boolean
 
-    /**
-     * 番号 afterSeq より新しいフレームを返す。無ければ最大 waitMs 待って、それでも無ければ null。
-     * dual なら 2 画面の右（カメラは一番広いレンズのまま、選んだ倍率に切り出したもの）
-     */
-    fun nextFrame(afterSeq: Long, waitMs: Long, dual: Boolean = false): Frame?
-
-    /** 2 画面の左。番号 afterSeq より新しいものを最大 waitMs 待つ。録画中など作れない間は null */
-    fun nextOverview(afterSeq: Long, waitMs: Long): Overview?
-
-    /** いま 2 画面で配信しているか */
-    val dualActiveNow: Boolean
+    /** 番号 afterSeq より新しいフレームを返す。無ければ最大 waitMs 待って、それでも無ければ null */
+    fun nextFrame(afterSeq: Long, waitMs: Long): Frame?
 
     /** 今のズームのまま撮影して DCIM に保存し、JPEG のバイト列を返す（ブロッキング） */
     fun capture(): ByteArray
@@ -218,7 +203,7 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
         res.addHeader("Access-Control-Allow-Origin", "*")
         res.addHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         res.addHeader("Access-Control-Allow-Headers", "*")
-        res.addHeader("Access-Control-Expose-Headers", "X-Frame-Seq, X-Overview-Zoom")
+        res.addHeader("Access-Control-Expose-Headers", "X-Frame-Seq")
         // https のトンネル経由で開いた G2 アプリから 127.0.0.1 を呼ぶとき（Private Network Access）
         res.addHeader("Access-Control-Allow-Private-Network", "true")
         res.addHeader("Access-Control-Max-Age", "600")
@@ -235,8 +220,7 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
 
             "/frame" -> {
                 val after = session.parameters["after"]?.firstOrNull()?.toLongOrNull() ?: 0L
-                val dual = session.parameters["dual"]?.firstOrNull() == "1"
-                val frame = camera.nextFrame(after, 200, dual)
+                val frame = camera.nextFrame(after, 200)
                 if (frame == null) {
                     // まだ 1 枚も無い → 503、新しいフレームが来なかっただけ → 204（クライアントはそのまま取り直す）
                     return if (camera.hasFrame) {
@@ -252,21 +236,6 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
                     frame.bytes.size.toLong(),
                 )
                 res.addHeader("X-Frame-Seq", frame.seq.toString())
-                res
-            }
-
-            "/overview" -> {
-                val after = session.parameters["after"]?.firstOrNull()?.toLongOrNull() ?: 0L
-                val ov = camera.nextOverview(after, 300)
-                    ?: return NanoHTTPD.newFixedLengthResponse(Response.Status.NO_CONTENT, "text/plain", "")
-                val res = NanoHTTPD.newFixedLengthResponse(
-                    Response.Status.OK,
-                    "image/jpeg",
-                    ByteArrayInputStream(ov.bytes),
-                    ov.bytes.size.toLong(),
-                )
-                res.addHeader("X-Frame-Seq", ov.seq.toString())
-                res.addHeader("X-Overview-Zoom", ov.zoom.toString())
                 res
             }
 
@@ -393,8 +362,6 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
             .put("zoomMax", camera.zoomMax.toDouble())
             .put("canRecord", true)
             .put("canPrepare", true)
-            .put("canDual", true)
-            .put("dual", camera.dualActiveNow)
             .put("audioPermitted", camera.audioPermitted)
             .put("armed", camera.armedQuality != null)
             .put("armedQuality", camera.armedQuality ?: JSONObject.NULL)
