@@ -158,6 +158,10 @@ interface CameraController {
     val armedResolution: String
     /** 録画の準備を休んでいる理由（"heat"）。休んでいなければ null。G2 録画はこの間、準備を頼み直さない */
     val armPausedReason: String?
+    /** 高温の判定（コンパニオンの画面で選んだもの）：止める温度（0 = G2 アプリに従う・-1 = 温度では止めない）・止める発熱の段階・熱いとみなす段階（0 = 使わない） */
+    val heatStopTemp: Int
+    val heatStopThermal: Int
+    val heatHotThermal: Int
     /** カメラを開いているか（要求が無くて閉じていれば false。次の要求で開く） */
     val cameraOpen: Boolean
     /** 負荷と配信の実測 */
@@ -368,6 +372,9 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
             .put("armedResolution", camera.armedResolution)
             .put("armPaused", camera.armPausedReason ?: JSONObject.NULL)
             .put("cameraOpen", camera.cameraOpen)
+            .put("heatStopTemp", camera.heatStopTemp)
+            .put("heatStopThermal", camera.heatStopThermal)
+            .put("heatHotThermal", camera.heatHotThermal)
             .put("recording", camera.recording != null)
             .put("pendingSegments", camera.pendingSegments)
             .put("merging", camera.mergingCount)

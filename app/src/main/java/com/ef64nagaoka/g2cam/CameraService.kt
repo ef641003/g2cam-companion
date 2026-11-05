@@ -302,6 +302,9 @@ class CameraService : LifecycleService(), CameraController {
     override val armedResolution: String get() = armed?.resolution ?: ""
     override val armPausedReason: String? get() = armPaused
     override val cameraOpen: Boolean get() = camera != null && !cameraIdle
+    override val heatStopTemp: Int get() = Prefs.heatStopTemp(this)
+    override val heatStopThermal: Int get() = Prefs.heatStopThermal(this)
+    override val heatHotThermal: Int get() = Prefs.heatHotThermal(this)
     override val loadInfo: LoadInfo
         get() = LoadInfo(
             cpuPct = LoadMonitor.latest?.cpuPct ?: -1,
@@ -2106,7 +2109,10 @@ class CameraService : LifecycleService(), CameraController {
             if (lastThermal >= 0 || m.thermal > 0) AppLog.i("発熱の段階が $lastThermal → ${m.thermal} に変わりました（${if (m.tempC.isNaN()) "温度不明" else "${fmt1(m.tempC)}度"}・CPU ${LoadMonitor.latest?.cpuPct ?: -1}%）")
             lastThermal = m.thermal
         }
-        val hot = m.thermal >= PowerManager.THERMAL_STATUS_SEVERE
+        // 「熱い」の段階・止める段階・止める温度はコンパニオンの画面で選べる（0.1.15）
+        val hotLevel = Prefs.heatHotThermal(this)
+        val stopLevel = Prefs.heatStopThermal(this)
+        val hot = hotLevel > 0 && m.thermal >= hotLevel
         if (hot != hotNow) {
             hotNow = hot
             refreshStreamInterval()
@@ -2115,8 +2121,9 @@ class CameraService : LifecycleService(), CameraController {
         streamLabel = buildStreamLabel()
         val s = session
         if (s != null) {
-            val hot = (s.opts.stopTempC > 0 && !m.tempC.isNaN() && m.tempC >= s.opts.stopTempC) ||
-                m.thermal >= PowerManager.THERMAL_STATUS_CRITICAL
+            val stopTemp = Prefs.effectiveStopTemp(this, s.opts.stopTempC)
+            val hot = (stopTemp > 0 && !m.tempC.isNaN() && m.tempC >= stopTemp) ||
+                (stopLevel > 0 && m.thermal >= stopLevel)
             if (hot) {
                 stopRecordingInternally("高温", "スマホが熱くなったので録画を止めて保存しました（${if (m.tempC.isNaN()) "発熱 段階${m.thermal}" else "${fmt1(m.tempC)}度"}）")
                 // 録画のあとの録りため（このあとに順番待ち）も、冷えるまで休ませる
@@ -2148,8 +2155,8 @@ class CameraService : LifecycleService(), CameraController {
             if (session != null) return
             // 録画の準備（録画の組み方で待つ）は、熱いときは解いて冷えるまで休む（冷えたら頼まれていた通りに準備し直す）
             val a0 = armed
-            val stopTemp = a0?.stopTempC ?: lastArm?.stopTempC ?: 0.0
-            val armHot = m.thermal >= PowerManager.THERMAL_STATUS_SEVERE || (stopTemp > 0 && !m.tempC.isNaN() && m.tempC >= stopTemp - 3)
+            val stopTemp = Prefs.effectiveStopTemp(this, a0?.stopTempC ?: lastArm?.stopTempC ?: 0.0)
+            val armHot = (hotLevel > 0 && m.thermal >= hotLevel) || (stopTemp > 0 && !m.tempC.isNaN() && m.tempC >= stopTemp - 3)
             if (a0 != null && armHot) {
                 AppLog.i("熱いので録画の準備を休みます（${if (m.tempC.isNaN()) "発熱 段階${m.thermal}" else "${fmt1(m.tempC)}度"}）。冷えたら準備し直します")
                 armPaused = "heat"
@@ -2157,7 +2164,7 @@ class CameraService : LifecycleService(), CameraController {
                 return
             }
             if (a0 == null && armPaused != null) {
-                val cooled = m.thermal < PowerManager.THERMAL_STATUS_MODERATE && (m.tempC.isNaN() || stopTemp <= 0 || m.tempC < stopTemp - 5)
+                val cooled = (hotLevel <= 0 || m.thermal < maxOf(1, hotLevel - 1)) && (m.tempC.isNaN() || stopTemp <= 0 || m.tempC < stopTemp - 5)
                 val req = lastArm
                 if (cooled && req != null && !cameraIdle && running && !stopping) {
                     AppLog.i("冷えたので録画の準備をし直します")
@@ -2175,11 +2182,12 @@ class CameraService : LifecycleService(), CameraController {
                 bufPaused = null
                 return
             }
-            val pauseAt = if (a.stopTempC > 0) a.stopTempC - 3 else 45.0
+            val effStop = Prefs.effectiveStopTemp(this, a.stopTempC)
+            val pauseAt = if (effStop > 0) effStop - 3 else if (Prefs.heatStopTemp(this) == -1) 999.0 else 45.0
             val paused = bufPaused
             val resume: Boolean
             if (paused == null) {
-                val hot = m.thermal >= PowerManager.THERMAL_STATUS_SEVERE || (!m.tempC.isNaN() && m.tempC >= pauseAt)
+                val hot = (hotLevel > 0 && m.thermal >= hotLevel) || (!m.tempC.isNaN() && m.tempC >= pauseAt)
                 val full = m.cacheFreeBytes in 0L until BUFFER_PAUSE_FREE
                 if (hot || full) {
                     Log.i(TAG, "遡り録画の録りためを休みます（${if (hot) "高温" else "空き容量"}）")
@@ -2191,7 +2199,7 @@ class CameraService : LifecycleService(), CameraController {
                 // 録りためが止まっていたら（始められなかった・途中で止まった）やり直す
                 resume = bufCur == null
             } else if (paused == "heat") {
-                resume = m.thermal < PowerManager.THERMAL_STATUS_MODERATE && (m.tempC.isNaN() || m.tempC < pauseAt - 2)
+                resume = (hotLevel <= 0 || m.thermal < maxOf(1, hotLevel - 1)) && (m.tempC.isNaN() || m.tempC < pauseAt - 2)
             } else {
                 resume = m.cacheFreeBytes < 0 || m.cacheFreeBytes > BUFFER_RESUME_FREE
             }

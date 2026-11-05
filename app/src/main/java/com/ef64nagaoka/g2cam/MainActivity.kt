@@ -15,12 +15,15 @@ import android.provider.Settings
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.LinearLayout
 import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.TextView
 import androidx.core.content.ContextCompat
 
@@ -80,6 +83,33 @@ class MainActivity : Activity() {
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    /** 見出しと選択欄（Spinner）。選ぶと onPick に値を渡す */
+    private fun addChoice(root: ViewGroup, title: String, labels: List<String>, values: IntArray, current: Int, onPick: (Int) -> Unit) {
+        root.addView(TextView(this).apply {
+            text = title
+            setPadding(0, dp(6), 0, 0)
+        })
+        val spinner = Spinner(this)
+        spinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, labels).apply {
+            setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        }
+        val idx = values.indexOf(current)
+        if (idx >= 0) spinner.setSelection(idx, false)
+        var last = current
+        spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                val v = values[position]
+                if (v == last) return // 最初の表示のときにも呼ばれる
+                last = v
+                onPick(v)
+                AppLog.i("設定を変えました：$title → ${labels[position]}")
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+        root.addView(spinner)
+    }
 
     private fun buildUi() {
         val root = LinearLayout(this).apply {
@@ -220,6 +250,45 @@ class MainActivity : Activity() {
                 if (StandbyService.running) startService(Intent(this@MainActivity, StandbyService::class.java).setAction(StandbyService.ACTION_OVERLAY_CHANGED))
                 handler.postDelayed({ render() }, 300)
             }
+        })
+
+        // ── 高温の判定（0.1.15）。G2 カメラ・G2 録画の両方に効く ──
+        root.addView(TextView(this).apply {
+            text = "高温の判定（G2 カメラ・G2 録画の両方）"
+            textSize = 16f
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, dp(16), 0, dp(4))
+        })
+        val tempValues = intArrayOf(0, -1) + (38..60).toList().toIntArray()
+        val tempLabels = tempValues.map {
+            when (it) {
+                0 -> "G2 アプリの設定に従う（G2 録画の「止める温度」。G2 カメラは温度では止めない）"
+                -1 -> "温度では止めない"
+                else -> "$it 度で止める"
+            }
+        }
+        addChoice(root, "録画を止めるスマホの温度（電池の温度）", tempLabels, tempValues, Prefs.heatStopTemp(this)) {
+            Prefs.setHeatStopTemp(this, it)
+        }
+        val stageNames = mapOf(1 to "軽い", 2 to "中くらい", 3 to "重い", 4 to "危険", 5 to "緊急", 6 to "停止寸前")
+        val stopValues = intArrayOf(2, 3, 4, 5, 6, 0)
+        addChoice(
+            root, "録画を止める発熱の段階（Android が知らせる段階）",
+            stopValues.map { if (it == 0) "段階では止めない" else "段階 $it（${stageNames[it]}）以上で止める" + if (it == 4) "（既定）" else "" },
+            stopValues, Prefs.heatStopThermal(this),
+        ) { Prefs.setHeatStopThermal(this, it) }
+        val hotValues = intArrayOf(1, 2, 3, 4, 5, 0)
+        addChoice(
+            root, "「熱い」とみなす発熱の段階（メガネへの配信を半分の fps に・録画の準備と遡り録画の録りためを休む）",
+            hotValues.map { if (it == 0) "使わない" else "段階 $it（${stageNames[it]}）以上" + if (it == 3) "（既定）" else "" },
+            hotValues, Prefs.heatHotThermal(this),
+        ) { Prefs.setHeatHotThermal(this, it) }
+        root.addView(TextView(this).apply {
+            text = "・止める温度の 3 度手前で、録画の準備と遡り録画の録りためを休みます（G2 録画はメガネにも知らせます）\n" +
+                "・止めるときは保存してから止めます。どちらも「止めない」にすると、スマホが熱いまま録り続けます（端末が自分でカメラを止めることがあります）\n" +
+                "・5 秒ごとに見て、次の見張りから効きます"
+            textSize = 13f
+            setPadding(0, dp(2), 0, dp(8))
         })
 
         root.addView(CheckBox(this).apply {

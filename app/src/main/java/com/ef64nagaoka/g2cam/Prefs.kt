@@ -18,6 +18,9 @@ object Prefs {
     private const val KEY_EXT_ON_DEMAND = "extensionOnDemand"
     private const val KEY_STANDBY_OVERLAY_ALWAYS = "standbyOverlayAlways"
     private const val KEY_STANDBY_STARTS = "standbyStarts"
+    private const val KEY_HEAT_STOP_TEMP = "heatStopTemp"
+    private const val KEY_HEAT_STOP_THERMAL = "heatStopThermal"
+    private const val KEY_HEAT_HOT_THERMAL = "heatHotThermal"
 
     private fun sp(context: Context) = context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
 
@@ -123,6 +126,39 @@ object Prefs {
     fun standbyStartsWithin(context: Context, ms: Long): Int {
         val now = System.currentTimeMillis()
         return standbyStarts(context).count { now - it < ms }
+    }
+
+    // ── 高温の判定（0.1.15。利用者が選べる） ──
+
+    /**
+     * 録画を止める電池の温度（度）。0 = G2 アプリの設定に従う（G2 録画は自分の設定、G2 カメラは温度では止めない）、
+     * -1 = 温度では止めない、38〜60 = その温度で止める
+     */
+    fun heatStopTemp(context: Context): Int = sp(context).getInt(KEY_HEAT_STOP_TEMP, 0).let { if (it == 0 || it == -1) it else it.coerceIn(38, 60) }
+
+    fun setHeatStopTemp(context: Context, value: Int) {
+        sp(context).edit().putInt(KEY_HEAT_STOP_TEMP, value).apply()
+    }
+
+    /** 録画を止める発熱の段階（Android の PowerManager の段階 3〜6）。0 = 段階では止めない。既定 4（危険） */
+    fun heatStopThermal(context: Context): Int = sp(context).getInt(KEY_HEAT_STOP_THERMAL, 4).let { if (it == 0) 0 else it.coerceIn(2, 6) }
+
+    fun setHeatStopThermal(context: Context, value: Int) {
+        sp(context).edit().putInt(KEY_HEAT_STOP_THERMAL, value).apply()
+    }
+
+    /** 「熱い」とみなす発熱の段階（配信の fps を半分・録画の準備と遡り録画の録りためを休む）。0 = 使わない。既定 3（重い） */
+    fun heatHotThermal(context: Context): Int = sp(context).getInt(KEY_HEAT_HOT_THERMAL, 3).let { if (it == 0) 0 else it.coerceIn(1, 6) }
+
+    fun setHeatHotThermal(context: Context, value: Int) {
+        sp(context).edit().putInt(KEY_HEAT_HOT_THERMAL, value).apply()
+    }
+
+    /** 実際に使う「録画を止める温度」。app は G2 アプリが頼んできた温度（0 で止めない）。0.0 なら温度では止めない */
+    fun effectiveStopTemp(context: Context, app: Double): Double = when (val v = heatStopTemp(context)) {
+        0 -> app
+        -1 -> 0.0
+        else -> v.toDouble()
     }
 
     /** 録画の組み方の記憶：向き・画質・静止画の有無ごとに、頼んだ画質が通った手ブレ補正のモード（0〜2） */
