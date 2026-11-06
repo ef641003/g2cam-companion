@@ -52,6 +52,85 @@ class MainActivity : Activity() {
         AppLog.init(this)
         buildUi()
         requestRuntimePermissions()
+        val f = android.content.IntentFilter(Updater.ACTION_INSTALL_STATUS)
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(installReceiver, f, RECEIVER_NOT_EXPORTED) else registerReceiver(installReceiver, f)
+    }
+
+    override fun onDestroy() {
+        try {
+            unregisterReceiver(installReceiver)
+        } catch (_: Exception) {
+        }
+        super.onDestroy()
+    }
+
+    // ── 更新（0.1.16〜）。配布ページ（GitHub の Releases）を見て、新しければ入れ替える ──
+    private lateinit var updateText: TextView
+    private lateinit var updateButton: Button
+    @Volatile private var latest: Updater.Release? = null
+    @Volatile private var updateBusy = false
+
+    private val installReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: android.content.Context, intent: Intent) {
+            val msg = Updater.handleStatus(this@MainActivity, intent) ?: return
+            updateBusy = false
+            AppLog.i(msg)
+            showUpdate(msg)
+        }
+    }
+
+    private fun showUpdate(text: String) {
+        runOnUiThread {
+            updateText.text = text
+            val rel = latest
+            val newer = rel != null && Updater.isNewer(rel.version, appVersion())
+            updateButton.text = if (newer) "${rel!!.version} に更新する" else "更新を確かめる"
+            updateButton.isEnabled = !updateBusy
+        }
+    }
+
+    /** 最新版を調べる。quiet なら新しい版が無いときは静かにしておく */
+    private fun checkUpdate(quiet: Boolean) {
+        if (updateBusy) return
+        updateBusy = true
+        if (!quiet) showUpdate("配布ページを確かめています…")
+        Thread {
+            try {
+                val rel = Updater.fetchLatest()
+                latest = rel
+                Prefs.setLastUpdateCheck(this, System.currentTimeMillis())
+                updateBusy = false
+                showUpdate(
+                    if (Updater.isNewer(rel.version, appVersion())) "新しい版 ${rel.version} があります（いまは ${appVersion()}）"
+                    else "最新です（${appVersion()}）",
+                )
+            } catch (e: Exception) {
+                updateBusy = false
+                showUpdate(if (quiet) "更新：確かめられませんでした（${e.message}）" else "確かめられませんでした：${e.message}")
+            }
+        }.start()
+    }
+
+    private fun startUpdate() {
+        val rel = latest ?: return checkUpdate(false)
+        if (!Updater.isNewer(rel.version, appVersion())) return checkUpdate(false)
+        if (!packageManager.canRequestPackageInstalls()) {
+            showUpdate("先に「この提供元のアプリを許可」をオンにしてから、もう一度押してください")
+            startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
+            return
+        }
+        updateBusy = true
+        showUpdate("${rel.version} を取り込んでいます…")
+        AppLog.i("更新を始めます：${appVersion()} → ${rel.version}")
+        Thread {
+            try {
+                Updater.downloadAndInstall(this, rel) { showUpdate(it) }
+            } catch (e: Exception) {
+                updateBusy = false
+                AppLog.w("更新に失敗：${e.message}")
+                showUpdate("更新できませんでした：${e.message}")
+            }
+        }.start()
     }
 
     @Deprecated("Deprecated in Java")
@@ -75,6 +154,8 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         handler.post(refresh)
+        // 6 時間に 1 回、開いたときに配布ページを見る
+        if (System.currentTimeMillis() - Prefs.lastUpdateCheck(this) > 6 * 3600_000L) checkUpdate(quiet = true)
     }
 
     override fun onPause() {
@@ -126,6 +207,18 @@ class MainActivity : Activity() {
             text = "スマホのカメラを G2 カメラアプリ（Even アプリ内）に渡し、画面が消えていても映像と撮影を続けます。写真は「写真」アプリの G2Camera フォルダに保存されます。"
             setPadding(0, dp(8), 0, dp(12))
         })
+
+        // ── 更新 ──
+        updateText = TextView(this).apply {
+            text = "版 ${appVersion()}"
+            textSize = 14f
+        }
+        root.addView(updateText)
+        updateButton = Button(this).apply {
+            text = "更新を確かめる"
+            setOnClickListener { startUpdate() }
+        }
+        root.addView(updateButton)
 
         status = TextView(this).apply {
             textSize = 16f

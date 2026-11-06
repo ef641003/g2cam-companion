@@ -37,6 +37,20 @@ jobs:
           name: g2cam-companion-debug
           path: app/build/outputs/apk/debug/app-debug.apk
 
+      # 配布ページ（Releases）に版ごとの APK を置く。コンパニオンの「更新」と、いつでも最新を指す
+      # https://github.com/ef641003/g2cam-companion/releases/latest/download/g2cam-companion.apk はここを見る
+      - name: 配布ページに APK を置く
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VER=$(grep -oP 'versionName = "\K[^"]+' app/build.gradle.kts)
+          cp app/build/outputs/apk/debug/app-debug.apk g2cam-companion.apk
+          if gh release view "v$VER" >/dev/null 2>&1; then
+            gh release upload "v$VER" g2cam-companion.apk --clobber
+          else
+            gh release create "v$VER" g2cam-companion.apk --target "$GITHUB_SHA" --title "コンパニオン $VER" --notes "$(git log -1 --pretty=%s)" --latest
+          fi
+
       # 遡り録画の区切りの計算（PreRollPlan）など、端末の要らない試験。APK を置いてから走らせる
       - name: 単体試験
         run: |

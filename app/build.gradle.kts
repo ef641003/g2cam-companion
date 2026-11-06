@@ -12,9 +12,26 @@ android {
         // 30 以上: camera 種別のフォアグラウンドサービス定数があり、MediaStore で DCIM に直接保存できる
         minSdk = 30
         targetSdk = 34
-        versionCode = 115
-        versionName = "0.1.15"
+        versionCode = 116
+        versionName = "0.1.16"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    // 署名の鍵を固定する（0.1.16 から）。以前は CI のたびに鍵が変わり、上書きで入れられなかった。
+    // 鍵はリポジトリの signing/g2cam.jks（利用者が了承。公開されているが、更新はこのリポジトリの配布からしか取らない）
+    signingConfigs {
+        create("fixed") {
+            storeFile = rootProject.file("signing/g2cam.jks")
+            storePassword = "g2cam-companion"
+            keyAlias = "g2cam"
+            keyPassword = "g2cam-companion"
+            storeType = "PKCS12"
+        }
+    }
+    buildTypes {
+        getByName("debug") {
+            signingConfig = signingConfigs.getByName("fixed")
+        }
     }
 
     compileOptions {

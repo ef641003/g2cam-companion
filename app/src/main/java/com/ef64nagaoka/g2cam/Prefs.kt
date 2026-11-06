@@ -18,6 +18,7 @@ object Prefs {
     private const val KEY_EXT_ON_DEMAND = "extensionOnDemand"
     private const val KEY_STANDBY_OVERLAY_ALWAYS = "standbyOverlayAlways"
     private const val KEY_STANDBY_STARTS = "standbyStarts"
+    private const val KEY_LAST_UPDATE_CHECK = "lastUpdateCheck"
     private const val KEY_HEAT_STOP_TEMP = "heatStopTemp"
     private const val KEY_HEAT_STOP_THERMAL = "heatStopThermal"
     private const val KEY_HEAT_HOT_THERMAL = "heatHotThermal"
@@ -126,6 +127,13 @@ object Prefs {
     fun standbyStartsWithin(context: Context, ms: Long): Int {
         val now = System.currentTimeMillis()
         return standbyStarts(context).count { now - it < ms }
+    }
+
+    /** 最後に配布ページを確かめた時刻（エポックミリ秒） */
+    fun lastUpdateCheck(context: Context): Long = sp(context).getLong(KEY_LAST_UPDATE_CHECK, 0L)
+
+    fun setLastUpdateCheck(context: Context, at: Long) {
+        sp(context).edit().putLong(KEY_LAST_UPDATE_CHECK, at).apply()
     }
 
     // ── 高温の判定（0.1.15。利用者が選べる） ──
