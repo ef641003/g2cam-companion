@@ -18,6 +18,7 @@ import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
+import android.media.CamcorderProfile
 import android.media.ImageReader
 import android.net.Uri
 import android.os.Handler
@@ -78,6 +79,7 @@ import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
 
@@ -149,6 +151,12 @@ class CameraService : LifecycleService(), CameraController {
 
         /** 画面表示用：低照度の状態（サービスが動いていなければ null） */
         fun lowLightText(): String? = instance?.describeLowLight()
+
+        /** 画面表示用：レンズの倍率と、いまのズームが光学かデジタルか（サービスが動いていなければ null） */
+        fun lensText(): String? = instance?.describeLens()
+
+        /** 画面表示用：録画の組み方（解像度・fps・細かさ。まだ束ねていなければ null） */
+        fun recordPlanText(): String? = instance?.recordResLabel?.takeIf { it != "－" }
     }
 
     // ── CameraController ──
@@ -253,8 +261,33 @@ class CameraService : LifecycleService(), CameraController {
     /** 夜景の拡張でメガネへの配信を束ねられないときの、捨てるだけのプレビューの受け口 */
     private var dummyThread: HandlerThread? = null
 
+    // ── fps の実測とレンズ（0.1.20）：撮影結果（カメラのスレッドに届く）から読む ──
+    /** カメラから届いた枚数（撮影結果の数。録画の fps の実測に使う） */
+    private val sensorFrames = java.util.concurrent.atomic.AtomicLong()
+    /** カメラのスレッドだけで使う：同じ結果が 2 回届く（配信と録画の両方に付けている）のを 1 回に数えるための番号と、1 秒ごとの締め */
+    private var lastFrameNumber = -1L
+    private var sensorWinStart = 0L
+    private var sensorWinFrames = 0L
+    @Volatile private var sensorFpsNow = 0.0
+    @Volatile private var lastSensorFrameAt = 0L
+    /** 60fps が出るかを確かめている間（暗くても fps を下げない） */
+    @Volatile private var fpsProbing = false
+    /** 60fps が使えなかった組み方と理由（このサービスが動いている間だけ覚える。その場かぎりの理由かもしれないため） */
+    private val plan60Failed = ConcurrentHashMap<String, String>()
+    /** レンズ：束ねたカメラの物理カメラ（焦点距離・センサーの大きさ）と、その説明 */
+    @Volatile private var lensCameraId: String? = null
+    @Volatile private var lensNote = "未確認（カメラを開くと確かめます）"
+    /** レンズの一覧（倍率の小さい順。カメラごとに 1 回だけ出す。カメラを閉じている間もそのまま返すので、G2 アプリのズームの段が揺れない） */
+    @Volatile private var lensList: List<LensInfo.Lens> = emptyList()
+    /** いま使っているレンズ（撮影結果から。端末が教えてくれるときだけ）と、そのときのズーム */
+    @Volatile private var activeLensId: String? = null
+    @Volatile private var activeLensZoom = 0f
+    @Volatile private var activeLensAt = 0L
+    @Volatile private var zoomChangedAt = 0L
+
     private val exposureCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+            countSensorFrame(result)
             onExposure(result)
         }
     }
@@ -292,6 +325,19 @@ class CameraService : LifecycleService(), CameraController {
         val isFinalized: Boolean get() = finalized.count == 0L
     }
 
+    /**
+     * 録画の fps・細かさ（0.1.20）：頼まれたもの（fpsWanted・bitrateLevel）と、束ねた結果
+     * （fps = 束ねた組み方の目標の fps、bitrate = 目標のビットレート。0 なら端末の標準のまま、fpsNote = 60fps が使えなかった理由）
+     */
+    private class Tuning(val fpsWanted: Int, val bitrateLevel: String, val fps: Int, val bitrate: Int, val fpsNote: String) {
+        companion object {
+            val DEFAULT = Tuning(30, VideoTuning.STD, 30, 0, "")
+        }
+    }
+
+    /** 録画の組み方を束ねた結果（実際の解像度。分からなければ空） */
+    private class Bound(val resolution: String, val tuning: Tuning)
+
     /** G2 録画が準備を頼んだときの組み方 */
     private class ArmedConfig(
         val quality: String,
@@ -300,9 +346,21 @@ class CameraService : LifecycleService(), CameraController {
         val facing: String,
         val stopTempC: Double,
         val resolution: String,
-    )
+        val tuning: Tuning = Tuning.DEFAULT,
+    ) {
+        /** 頼まれた組み方（画質・静止画の有無・fps・細かさ・向き）が、この準備と同じか */
+        fun sameAs(quality: String, still: Boolean, fps: Int, bitrate: String, facing: String): Boolean =
+            this.quality == quality && this.still == still && tuning.fpsWanted == fps && tuning.bitrateLevel == bitrate && this.facing == facing
+    }
 
-    private class ArmRequest(val quality: String, val audio: Boolean, val still: Boolean, val stopTempC: Double)
+    private class ArmRequest(
+        val quality: String,
+        val audio: Boolean,
+        val still: Boolean,
+        val stopTempC: Double,
+        val fps: Int = 30,
+        val bitrate: String = VideoTuning.STD,
+    )
 
     /** 1 本目につなぐ遡りの材料 */
     private class PreRollUse(val prev: Rec?, val plan: PreRollPlan.Plan)
@@ -320,16 +378,23 @@ class CameraService : LifecycleService(), CameraController {
         val preRoll: PreRollUse?,
         /** 1 本目の保存名 */
         val firstName: String,
+        /** fps・細かさ（0.1.20） */
+        val tuning: Tuning = Tuning.DEFAULT,
     ) {
         @Volatile var current: Rec = current
         @Volatile var segment = 1
         @Volatile var thumb: ByteArray? = null
         @Volatile var finishedBytes = 0L
         var timer: Runnable? = null
+        /** いまの 1 本を録り始めたときの、カメラから届いた枚数と時刻（実測の fps を出すため） */
+        @Volatile var segFrames0 = 0L
+        @Volatile var segStartAt = 0L
+        /** 止める直前に出した、いまの 1 本の実測の fps（まだなら 0） */
+        @Volatile var segFps = 0.0
     }
 
-    /** 束ね方：recorder があれば録画つき（静止画も束ねるか・電子式手ブレ補正のモード 0=なし） */
-    private class BindSpec(val recorder: Recorder, val still: Boolean, val eis: Int)
+    /** 束ね方：recorder があれば録画つき（静止画も束ねるか・電子式手ブレ補正のモード 0=なし・fps。60 のときだけ目標の fps を付ける） */
+    private class BindSpec(val recorder: Recorder, val still: Boolean, val eis: Int, val fps: Int = 30)
 
     // ── 録画の状態（recordLock の中で変える。読むだけなら外からでもよい） ──
     @Volatile private var session: Session? = null
@@ -348,6 +413,14 @@ class CameraService : LifecycleService(), CameraController {
     override val recording: RecordingState? get() = session?.let { snapshot(it) }
     override val armedQuality: String? get() = armed?.quality
     override val armedResolution: String get() = armed?.resolution ?: ""
+    override val armedFps: Int get() = armed?.tuning?.fps ?: 0
+    override val armedFpsWanted: Int get() = armed?.tuning?.fpsWanted ?: 0
+    override val armedFpsNote: String get() = armed?.tuning?.fpsNote ?: ""
+    override val armedBitrate: String get() = armed?.tuning?.bitrateLevel ?: ""
+    override val sensorFps: Double
+        get() = if (camera == null || cameraIdle || SystemClock.elapsedRealtime() - lastSensorFrameAt > 1500L) 0.0 else sensorFpsNow
+    override val lensStatus: LensStatus
+        get() = LensStatus(lensesNow(), zoomStateNow(), lensNote)
     override val armPausedReason: String? get() = armPaused
     override val cameraOpen: Boolean get() = camera != null && !cameraIdle
     override val heatStopTemp: Int get() = Prefs.heatStopTemp(this)
@@ -375,6 +448,7 @@ class CameraService : LifecycleService(), CameraController {
             range = appliedLowLight?.let { "${it.lower}-${it.upper}" } ?: "",
             lastCaptureMode = lastCaptureMode,
             level = Prefs.lowLightLevel(this),
+            videoMin = Prefs.lowLightVideoMin(this),
         )
 
     private val lowLightActive: Boolean get() = synchronized(lowLightLock) { lowLightDetector.active }
@@ -416,7 +490,7 @@ class CameraService : LifecycleService(), CameraController {
         return (if (on) "オン（判定 ${lv.label}：約 ${lv.enterLux.roundToInt()} lux 以下で暗い）" else "オフ") +
             (if (live) "・いま $now$applied" else "") +
             "・夜景の拡張 $night${if (!Prefs.lowLightNight(this)) "（使わない設定）" else ""}" +
-            "・録画は${if (Prefs.lowLightVideo(this)) "明るさ優先" else "そのまま"}" +
+            "・録画は${LowLight.videoMinLabel(Prefs.lowLightVideoMin(this))}" +
             (if (live && lastCaptureMode.isNotEmpty()) "・直近の撮影=$lastCaptureMode" else "")
     }
 
@@ -452,9 +526,12 @@ class CameraService : LifecycleService(), CameraController {
 
     private fun buildDiag(): String {
         val a = armed
-        val ready = if (a != null) "準備済み（${a.quality} ${a.resolution.ifEmpty { "解像度不明" }}${if (a.still) "・撮影あり" else ""}）" else if (armPaused != null) "休止中（高温）" else "なし"
+        val ready = if (a != null) {
+            "準備済み（${a.quality} ${a.resolution.ifEmpty { "解像度不明" }}・${a.tuning.fps}fps・細かさ ${a.tuning.bitrateLevel}${if (a.still) "・撮影あり" else ""}）"
+        } else if (armPaused != null) "休止中（高温）" else "なし"
         return "構成=${if (cameraIdle) "カメラを閉じている（待機）" else boundLabel}・静止画の拡張=$extensionLabel・手ブレ補正=$stabLabel・録画の解像度=$recordResLabel・録画の準備=$ready・保存先=${Storage.describe(this)}" +
             "・低照度=${describeLowLight(live = false)}" +
+            "・レンズ=$lensNote" +
             (if (bindNotes.isNotEmpty()) "・束ね直しの失敗=$bindNotes" else "")
     }
 
@@ -1059,11 +1136,146 @@ class CameraService : LifecycleService(), CameraController {
 
     // ── 低照度（0.1.19） ──
 
+    // ── fps の実測とレンズ（0.1.20） ──
+
+    /** カメラから 1 枚届いた（カメラのスレッド）。同じ結果は 1 回だけ数え、1 秒ごとに fps を締める */
+    private fun countSensorFrame(r: TotalCaptureResult) {
+        val n = r.frameNumber
+        if (n == lastFrameNumber) return
+        lastFrameNumber = n
+        val total = sensorFrames.incrementAndGet()
+        val now = SystemClock.elapsedRealtime()
+        lastSensorFrameAt = now
+        if (sensorWinStart == 0L || now - sensorWinStart > 3000L) {
+            sensorWinStart = now
+            sensorWinFrames = total
+        } else if (now - sensorWinStart >= 1000L) {
+            sensorFpsNow = (total - sensorWinFrames) * 1000.0 / (now - sensorWinStart)
+            sensorWinStart = now
+            sensorWinFrames = total
+        }
+    }
+
+    /**
+     * 束ね直した直後に、カメラから want fps が届くかを確かめる（メイン以外から）。（届いたか, 見た fps）を返す。
+     * 束ね直した直後は、前の組み方の残りが届いたり、新しい組み方が流れ始めるまで間が空いたりするので、
+     * 0.4 秒ずつ区切って数え、2 区切り続けて届いたら「届いた」、流れ始めてから 2 秒たっても届かなければ「届かない」とする
+     */
+    private fun measureSensorFps(want: Int): Pair<Boolean, Double> {
+        val deadline = SystemClock.elapsedRealtime() + 5000L
+        var best = 0.0
+        var okInARow = 0
+        var streamingSince = 0L
+        while (SystemClock.elapsedRealtime() < deadline) {
+            val a = sensorFrames.get()
+            val ta = SystemClock.elapsedRealtimeNanos()
+            Thread.sleep(400)
+            val b = sensorFrames.get()
+            val tb = SystemClock.elapsedRealtimeNanos()
+            val fps = if (tb > ta) (b - a) * 1e9 / (tb - ta) else 0.0
+            val now = SystemClock.elapsedRealtime()
+            if (VideoTuning.fpsOk(fps, want)) {
+                okInARow += 1
+                if (fps > best) best = fps
+                if (okInARow >= 2) return Pair(true, fps)
+                continue
+            }
+            okInARow = 0
+            if (fps >= 5.0) {
+                if (fps > best) best = fps
+                if (streamingSince == 0L) streamingSince = now
+                if (now - streamingSince >= 2000L) break
+            } else {
+                streamingSince = 0L
+            }
+        }
+        // 届いたのが 1 区切りだけ（続かなかった・時間切れ）のときは、届いていないとみなす
+        return Pair(false, best)
+    }
+
+    /** 束ねたカメラのレンズ（物理カメラ）を読む。同じカメラなら読み直さない（束ねた直後に呼ぶ） */
+    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
+    private fun readLenses(cam: Camera) {
+        try {
+            val id = Camera2CameraInfo.from(cam.cameraInfo).cameraId
+            if (id == lensCameraId) return
+            val cm = getSystemService(CameraManager::class.java)
+            val chars = cm.getCameraCharacteristics(id)
+            val ids = chars.physicalCameraIds
+            val list = ArrayList<LensInfo.Physical>()
+            for (pid in ids) {
+                try {
+                    val c = cm.getCameraCharacteristics(pid)
+                    val f = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
+                    val s = c.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+                    if (f != null && s != null) list.add(LensInfo.Physical(pid, f, s.width, s.height))
+                } catch (e: Exception) {
+                    Log.w(TAG, "physical camera $pid unreadable", e)
+                }
+            }
+            // ズームの範囲は、カメラの特性から読む（束ねた直後は CameraX のズームの状態がまだ入っていないことがある）
+            val range = chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+            val z = cam.cameraInfo.zoomState.value
+            val zoomLo = (range?.lower ?: z?.minZoomRatio ?: 1f).toDouble()
+            val zoomHi = (range?.upper ?: z?.maxZoomRatio ?: chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f).toDouble()
+            val lenses = LensInfo.lenses(list, zoomLo, zoomHi)
+            lensList = lenses
+            lensCameraId = id
+            lensNote = when {
+                ids.size < 2 -> "この端末はレンズごとの情報を出していません（光学かデジタルかは分かりません）"
+                lenses.isEmpty() -> "レンズの情報から倍率を出せませんでした"
+                else -> LensInfo.describe(lenses)
+            }
+            val raw = list.joinToString(" / ") {
+                "id=${it.id} 焦点 ${it.focalMm}mm・センサー ${fmt1(it.sensorW.toDouble())}x${fmt1(it.sensorH.toDouble())}mm（35mm 判換算 ${it.eq35.roundToInt()}mm）"
+            }
+            AppLog.i("レンズ（カメラ $id・ズーム x${LensInfo.fmt(zoomLo)}〜x${LensInfo.fmt(zoomHi)}）：$lensNote${if (raw.isNotEmpty()) "　［$raw］" else ""}")
+        } catch (e: Exception) {
+            Log.w(TAG, "lens read failed", e)
+            lensNote = "レンズの情報を読めませんでした"
+        }
+    }
+
+    /** 端末のレンズ（倍率の小さい順。分からなければ空） */
+    private fun lensesNow(): List<LensInfo.Lens> = lensList
+
+    /** いまのズームが光学かデジタルか（カメラを閉じていれば「分からない」） */
+    private fun zoomStateNow(): LensInfo.ZoomState {
+        if (camera == null || cameraIdle) return LensInfo.ZoomState(null, null, null)
+        val now = SystemClock.elapsedRealtime()
+        val z = zoomNow
+        // いま使っているレンズ（撮影結果から）は、直近の結果で、ズームが落ち着いたあとのものだけ信じる
+        val reported = activeLensZoom
+        val settled = if (reported > 0f) abs(reported - z) <= z * 0.03f else now - zoomChangedAt > 800L
+        val fresh = now - activeLensAt < 2000L && settled
+        return LensInfo.zoomState(lensesNow(), z.toDouble(), if (fresh) activeLensId else null)
+    }
+
+    /** 画面・診断用：レンズと、いまのズームの説明 */
+    fun describeLens(): String {
+        val open = camera != null && !cameraIdle
+        if (!open) return lensNote
+        val st = zoomStateNow()
+        val now = when {
+            st.optical == null -> "いま x${LensInfo.fmt(zoomNow.toDouble())}"
+            else -> "いま x${LensInfo.fmt(zoomNow.toDouble())}＝${LensInfo.describe(st)}"
+        }
+        return "$lensNote（$now）"
+    }
+
     /** 露出の値が届いた（カメラのスレッド）。間引いて暗さを判定し、変わったら露光の決め方を合わせる */
     private fun onExposure(r: TotalCaptureResult) {
         val now = SystemClock.elapsedRealtime()
         if (now - lastExposureAt < EXPOSURE_SAMPLE_MS) return
         lastExposureAt = now
+        try {
+            // いま使っているレンズ（複数レンズを 1 つのカメラとして見せる端末が教えてくれる）と、そのときのズーム
+            activeLensId = r.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)
+            activeLensZoom = r.get(CaptureResult.CONTROL_ZOOM_RATIO) ?: 0f
+            activeLensAt = now
+        } catch (e: Exception) {
+            Log.w(TAG, "active lens read failed", e)
+        }
         try {
             val t = r.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: return
             val iso = r.get(CaptureResult.SENSOR_SENSITIVITY) ?: return
@@ -1122,7 +1334,7 @@ class CameraService : LifecycleService(), CameraController {
             appliedLowLight = want
             if (prev != want) {
                 AppLog.i(
-                    if (want != null) "低照度：露光を長めにしました（fps $want${if (recCtx) "・録画も明るさ優先" else ""}。$why）"
+                    if (want != null) "低照度：露光を長めにしました（fps $want${if (recCtx) "・録画は${LowLight.videoMinLabel(Prefs.lowLightVideoMin(this))}" else ""}。$why）"
                     else "低照度：露光を元に戻しました（$why）",
                 )
             }
@@ -1133,16 +1345,19 @@ class CameraService : LifecycleService(), CameraController {
     @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
     private fun desiredLowLightRange(cam: Camera, recCtx: Boolean): LowLight.FpsRange? {
         if (!Prefs.lowLightAuto(this) || !lowLightDetector.active) return null
+        // 60fps が出るかを確かめている間は掛けない（暗さで fps が下がると、確かめられない）
+        if (fpsProbing) return null
         // 端末の拡張（夜景・HDR など）が露出を受け持っている間は掛けない
         if (extensionBound) return null
-        // 録画中・録画の準備中は、録画も明るさ優先にする設定のときだけ
-        if (recCtx && !Prefs.lowLightVideo(this)) return null
+        // 録画中・録画の準備中は、設定「暗いときの録画」が「fps を下げない」以外のときだけ（下限は設定に従う）
+        val videoMin = Prefs.lowLightVideoMin(this)
+        if (recCtx && videoMin == 0) return null
         val ranges = try {
             Camera2CameraInfo.from(cam.cameraInfo).getCameraCharacteristic(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
         } catch (e: Exception) {
             null
         } ?: return null
-        return LowLight.pickRange(ranges.map { LowLight.FpsRange(it.lower, it.upper) }, recCtx)
+        return LowLight.pickRange(ranges.map { LowLight.FpsRange(it.lower, it.upper) }, recCtx, if (videoMin == 0) LowLight.RECORDING_MIN_FPS else videoMin)
     }
 
     /** カメラを閉じた・手放した：表示用の値を消し、ならしをやり直す（暗いかどうかの判定は残す） */
@@ -1386,6 +1601,8 @@ class CameraService : LifecycleService(), CameraController {
             var eisOn = false
             val video = if (spec != null) {
                 val vb = VideoCapture.Builder(spec.recorder).setTargetRotation(rotation)
+                // 60fps（0.1.20）：目標の fps を付ける。30fps のときは付けない（これまでと同じ組み方のまま）
+                if (spec.fps >= 50) vb.setTargetFrameRate(android.util.Range(spec.fps, spec.fps))
                 try {
                     Camera2Interop.Extender(vb).setSessionCaptureCallback(exposureCallback)
                 } catch (e: Exception) {
@@ -1479,6 +1696,8 @@ class CameraService : LifecycleService(), CameraController {
             } catch (e: Exception) {
                 Log.w(TAG, "aperture read failed", e)
             }
+            // レンズ（超広角・標準・望遠）の倍率を読む（カメラが変わったときだけ）
+            readLenses(bound)
             // 低照度の露光を、この組み方（写真か録画か・拡張の有無）に合わせて掛け直す
             reconcileLowLight("束ね直し", force = true)
             // ズームは束ね直すと 1 に戻るので、直前の倍率を掛け直す
@@ -1601,6 +1820,7 @@ class CameraService : LifecycleService(), CameraController {
         val target = if (state != null) zoom.toFloat().coerceIn(state.minZoomRatio, state.maxZoomRatio) else 1f
         // 結果は待たない（ズーム中も映像は流れ続ける）。1 未満なら端末が超広角に、大きければ望遠に切り替える
         cam.cameraControl.setZoomRatio(target)
+        if (target != zoomNow) zoomChangedAt = SystemClock.elapsedRealtime()
         zoomNow = target
         return target
     }
@@ -1618,6 +1838,8 @@ class CameraService : LifecycleService(), CameraController {
             }
             facingValue = next
             zoomNow = 1f
+            // 別のカメラになる：レンズの一覧は束ね直したときに読み直す
+            lensList = emptyList()
             frameLock.withLock { latestFrame = null }
             // 別のカメラになる：夜景の組み方は外し、明るさのならしをやり直す
             nightWanted = false
@@ -1627,8 +1849,8 @@ class CameraService : LifecycleService(), CameraController {
             val a = armed
             if (a != null) {
                 try {
-                    val res = bindForRecordingLocked(a.quality, a.still)
-                    armed = ArmedConfig(a.quality, a.audio, a.still, next, a.stopTempC, res)
+                    val b = bindForRecordingLocked(a.quality, a.still, a.tuning.fpsWanted, a.tuning.bitrateLevel)
+                    armed = ArmedConfig(a.quality, a.audio, a.still, next, a.stopTempC, b.resolution, b.tuning)
                     bufRetryAt = 0
                     requestBufferStart()
                 } catch (e: Exception) {
@@ -1744,78 +1966,280 @@ class CameraService : LifecycleService(), CameraController {
 
     private fun sizeLabel(s: Size): String = "${maxOf(s.width, s.height)}x${minOf(s.width, s.height)}"
 
-    private fun newRecorder(q: Quality): Recorder = Recorder.Builder()
-        .setExecutor(recorderExecutor)
-        .setQualitySelector(QualitySelector.from(q, FallbackStrategy.lowerQualityOrHigherThan(Quality.SD)))
-        .build()
+    private fun newRecorder(q: Quality, bitrate: Int? = null): Recorder {
+        val b = Recorder.Builder()
+            .setExecutor(recorderExecutor)
+            .setQualitySelector(QualitySelector.from(q, FallbackStrategy.lowerQualityOrHigherThan(Quality.SD)))
+        // 録画の細かさ（0.1.20）：標準なら指定しない（CameraX が端末の標準から決める）
+        if (bitrate != null) b.setTargetVideoEncodingBitRate(bitrate)
+        return b.build()
+    }
+
+    /** 短辺の画素数 → 画質（ビットレートの目安を引くため） */
+    private fun qualityOfShort(short: Int): Quality = when {
+        short >= 2160 -> Quality.UHD
+        short >= 1080 -> Quality.FHD
+        short >= 720 -> Quality.HD
+        else -> Quality.SD
+    }
+
+    /** 端末の標準のビットレート（bps）と、そのときの fps（画質ごと。読めなければ目安） */
+    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
+    private fun baseBitrate(q: Quality): Pair<Int, Int> {
+        try {
+            val bound = camera?.let { Camera2CameraInfo.from(it.cameraInfo).cameraId.toIntOrNull() }
+            val id = bound ?: if (facingValue == "user") 1 else 0
+            val cq = when (q) {
+                Quality.UHD -> CamcorderProfile.QUALITY_2160P
+                Quality.FHD -> CamcorderProfile.QUALITY_1080P
+                Quality.HD -> CamcorderProfile.QUALITY_720P
+                else -> CamcorderProfile.QUALITY_480P
+            }
+            if (CamcorderProfile.hasProfile(id, cq)) {
+                @Suppress("DEPRECATION")
+                val prof: CamcorderProfile? = CamcorderProfile.get(id, cq)
+                if (prof != null && prof.videoBitRate > 0) {
+                    return Pair(prof.videoBitRate, if (prof.videoFrameRate > 0) prof.videoFrameRate else 30)
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "camcorder profile unreadable", e)
+        }
+        return Pair(VideoTuning.fallbackBitrate(shortSideOf(q)), 30)
+    }
+
+    /** 目標のビットレート（bps。標準なら null = 指定しない） */
+    private fun bitrateFor(q: Quality, level: String, fps: Int): Int? {
+        if (level == VideoTuning.STD) return null
+        val base = baseBitrate(q)
+        return VideoTuning.targetBitrate(level, base.first, base.second, fps)
+    }
+
+    /** この端末のカメラ（いまの向き）が 60fps を出せるか（AE の fps 範囲に 60 があるか） */
+    private fun camera60Supported(): Boolean = try {
+        val cm = getSystemService(CameraManager::class.java)
+        val want = if (facingValue == "user") CameraCharacteristics.LENS_FACING_FRONT else CameraCharacteristics.LENS_FACING_BACK
+        val ranges = cm.cameraIdList
+            .map { cm.getCameraCharacteristics(it) }
+            .firstOrNull { it.get(CameraCharacteristics.LENS_FACING) == want }
+            ?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: emptyArray()
+        VideoTuning.supports60(ranges.map { LowLight.FpsRange(it.lower, it.upper) })
+    } catch (e: Exception) {
+        false
+    }
 
     /**
-     * 録画できる組み方に束ねる（recordLock の中で、メイン以外から呼ぶ）。実際の解像度（分からなければ空）を返す。
-     * 前に頼んだ画質が通った組み方（向き・画質・静止画の有無ごとに覚える）があれば、それで 1 回だけ束ねる。
+     * 60fps の組み方を確かめて束ねる（recordLock の中で、メイン以外から）。使えたら（手ブレ補正のモード, ""）、使えなければ（-1, 理由）。
+     * 使えるとは：束ねられる・メガネへの配信（静止画つきの頼み方なら録画中の撮影も）を保てる・解像度が頼んだ画質に届く・
+     * カメラから実際に 60fps が届く。60fps のために、メガネの映像や録画中の撮影を手放すことはしない。
+     * 手ブレ補正がオンのときは、電子式の補正つきの組み方だけを使う（利用者の選択：手ブレ補正を優先。端末に電子式の補正が無ければ補正なしで使う）。
+     * 通った組み方は覚えて、次からは測らずに 1 回で束ねる。通らなかった理由は、このサービスが動いている間だけ覚える
+     */
+    private fun try60Locked(quality: String, want: Quality, wantShort: Int, still: Boolean, stabOn: Boolean, level: String, tried: MutableList<String>): Pair<Int, String> {
+        if (!camera60Supported()) {
+            tried.add("60fps=端末のカメラが非対応")
+            return Pair(-1, "この端末のカメラは 60fps に対応していません（30fps で録ります）")
+        }
+        val key = Prefs.plan60Key(facingValue, quality, still, stabOn)
+        val failed = plan60Failed[key]
+        if (failed != null) {
+            tried.add("60fps=使えない（確かめ済み）")
+            return Pair(-1, failed)
+        }
+        val cached = Prefs.plan60(this, key)
+        val hasNormal = availableStabModes().contains(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)
+        val plans = if (cached != null) listOf(cached) else VideoTuning.plans60(stabOn, chooseEisMode(), hasNormal)
+        val bitrate = bitrateFor(want, level, 60)
+        var sawLowRes = false
+        var sawSlow = false
+        var okWithoutStab = false
+        // メガネへの配信・録画中の撮影を束ねられなかった（何を失うか）
+        var lost = ""
+        fpsProbing = true
+        try {
+            for (e in plans) {
+                rebindAndWait(BindSpec(newRecorder(want, bitrate), still, e, 60))
+                val v = videoCapture
+                if (v == null) {
+                    tried.add("60fps・補正$e=束ねられない")
+                    continue
+                }
+                val size = videoSize(v)
+                val short = size?.let { minOf(it.width, it.height) } ?: 0
+                val label = size?.let { sizeLabel(it) } ?: "不明"
+                val missing = if (imageAnalysis == null) "メガネの映像" else if (still && imageCapture == null) "録画中の撮影" else ""
+                if (missing.isNotEmpty()) {
+                    lost = missing
+                    tried.add("60fps・補正$e=$label（${missing}を束ねられないので使わない）")
+                    continue
+                }
+                if (size != null && short < wantShort) {
+                    sawLowRes = true
+                    tried.add("60fps・補正$e=$label（画質が下がるので使わない）")
+                    continue
+                }
+                if (cached != null) {
+                    // 覚えていた組み方は、測らずに使う（録画を始めるのを遅らせない。実際の fps は /status に出る）
+                    tried.add("60fps・補正$e=$label（覚えていた組み方）")
+                    return Pair(e, "")
+                }
+                val measured = measureSensorFps(60)
+                tried.add("60fps・補正$e=$label・実測 ${fmt1(measured.second)}fps${if (measured.first) "" else "（届かない）"}")
+                if (measured.first) {
+                    Prefs.setPlan60(this, key, e)
+                    return Pair(e, "")
+                }
+                sawSlow = true
+            }
+            // 補正つきでは 60fps が出なかった：補正なしなら出るかだけ確かめる（使わない。理由を正しく伝えるため）
+            if (sawSlow && stabOn && !plans.contains(0)) {
+                rebindAndWait(BindSpec(newRecorder(want, bitrate), still, 0, 60))
+                val v = videoCapture
+                if (v != null) {
+                    val size = videoSize(v)
+                    val short = size?.let { minOf(it.width, it.height) } ?: 0
+                    val measured = measureSensorFps(60)
+                    val full = imageAnalysis != null && (!still || imageCapture != null)
+                    okWithoutStab = full && (size == null || short >= wantShort) && measured.first
+                    tried.add("60fps・補正0=${size?.let { sizeLabel(it) } ?: "不明"}・実測 ${fmt1(measured.second)}fps（確かめただけ。補正を優先するので使わない）")
+                }
+            }
+        } finally {
+            fpsProbing = false
+        }
+        // 覚えていた組み方が通らなくなった：忘れて、次に確かめ直す
+        if (cached != null) Prefs.clearPlan60(this, key)
+        val why = when {
+            okWithoutStab -> "手ブレ補正を使うと 60fps が出ません（手ブレ補正を優先して 30fps で録ります。コンパニオンの手ブレ補正を切ると 60fps で録れます）"
+            lost.isNotEmpty() && !sawSlow && !sawLowRes -> "60fps では${lost}を保てません（${lost}を優先して 30fps で録ります）"
+            sawLowRes && !sawSlow -> "この画質では 60fps が使えません（画質を保って 30fps で録ります。画質を下げると使えることがあります）"
+            sawSlow -> "この画質の組み方では 60fps が出ません（30fps で録ります。" +
+                (if (still) "録画中も写真を撮れる組み方のためかもしれません。G2 録画では使えることがあります" else "画質を下げると使えることがあります") + "）"
+            else -> "60fps の組み方で束ねられません（30fps で録ります）"
+        }
+        if (cached == null) plan60Failed[key] = why
+        return Pair(-1, why)
+    }
+
+    /**
+     * 60fps の組み方で録画を始められなかった：この組み方では 60fps が使えないと覚え、30fps の組み方で束ね直す（recordLock の中で）。
+     * 束ね直した結果を返す（頼まれた fps は 60 のまま、実際は 30、理由つき）
+     */
+    private fun downgrade60Locked(quality: String, still: Boolean, bitrate: String, why: String): Bound {
+        val key = Prefs.plan60Key(facingValue, quality, still, Prefs.stabilization(this))
+        plan60Failed[key] = "60fps では録画を始められませんでした（30fps で録ります）"
+        Prefs.clearPlan60(this, key)
+        AppLog.i("60fps の組み方で録画を始められないので、30fps に戻します（$why）")
+        return bindForRecordingLocked(quality, still, 60, bitrate)
+    }
+
+    /**
+     * 録画できる組み方に束ねる（recordLock の中で、メイン以外から呼ぶ）。実際の解像度と、fps・細かさの結果を返す。
+     * 60fps を頼まれたら（0.1.20）、まず 60fps の組み方を確かめる（try60Locked）。使えなければ 30fps の組み方にして、理由を返す。
+     * 30fps の組み方：前に頼んだ画質が通った組み方（向き・画質・静止画の有無ごとに覚える）があれば、それで 1 回だけ束ねる。
      * 無ければ手ブレ補正のモードを強い順に試し、頼んだ画質が通ったもの（だめなら一番高かったもの）を覚える。
      * 録画できる組み方が無ければ、配信＋撮影に戻して例外を投げる。
      */
-    private fun bindForRecordingLocked(quality: String, still: Boolean): String {
+    private fun bindForRecordingLocked(quality: String, still: Boolean, fps: Int = 30, bitrate: String = VideoTuning.STD): Bound {
         // 録画の組み方に移る：撮影のための夜景の組み方は求めない（録画のあと元に戻すときに、夜景で束ね直さない）
         nightWanted = false
         val want = qualityOf(quality)
         val wantShort = shortSideOf(want)
         val stabOn = Prefs.stabilization(this)
+        val wantFps = VideoTuning.fpsOf(fps)
+        val level = VideoTuning.levelOf(bitrate)
         val tried = ArrayList<String>()
         fun tag(e: Int) = "${if (still) "撮影あり" else "撮影なし"}・補正$e"
-        // 手ブレ補正がオフなら補正なしの 1 通りだけ
-        val cached = if (stabOn) Prefs.planEis(this, facingValue, quality, still) else 0
-        var done = false
-        if (cached != null) {
-            rebindAndWait(BindSpec(newRecorder(want), still, cached))
-            val v = videoCapture
-            if (v != null) {
-                tried.add("${tag(cached)}=${videoSize(v)?.let { sizeLabel(it) } ?: "不明"}${if (stabOn) "（覚えていた組み方）" else ""}")
-                done = true
+        var useFps = 30
+        // 束ねた組み方の手ブレ補正のモード（束ねられていなければ -1）
+        var useEis = -1
+        var fpsNote = ""
+        if (wantFps == 60) {
+            val r = try60Locked(quality, want, wantShort, still, stabOn, level, tried)
+            if (r.first >= 0) {
+                useFps = 60
+                useEis = r.first
+                // 確かめている間は暗くても fps を下げていないので、ここで合わせ直す
+                reconcileLowLight("60fps の組み方", force = true)
             } else {
-                tried.add("${tag(cached)}=束ねられない")
+                fpsNote = r.second
+                AppLog.i("60fps は使いません：$fpsNote")
             }
         }
-        if (!done && stabOn) {
-            val modes = availableStabModes()
-            val eis0 = chooseEisMode() ?: 0
-            val plans = ArrayList<Int>()
-            fun add(e: Int) {
-                if (!plans.contains(e) && e != cached) plans.add(e)
-            }
-            add(eis0)
-            if (eis0 == 2 && modes.contains(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)) add(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)
-            add(0)
-            var bestEis = -1
-            var bestShort = -1
-            var lastBound = -1
-            for (e in plans) {
-                rebindAndWait(BindSpec(newRecorder(want), still, e))
+        if (useFps != 60) {
+            val bitrate30 = bitrateFor(want, level, 30)
+            // 手ブレ補正がオフなら補正なしの 1 通りだけ
+            val cached = if (stabOn) Prefs.planEis(this, facingValue, quality, still) else 0
+            var done = false
+            if (cached != null) {
+                rebindAndWait(BindSpec(newRecorder(want, bitrate30), still, cached))
                 val v = videoCapture
-                if (v == null) {
-                    tried.add("${tag(e)}=束ねられない")
-                    continue
+                if (v != null) {
+                    tried.add("${tag(cached)}=${videoSize(v)?.let { sizeLabel(it) } ?: "不明"}${if (stabOn) "（覚えていた組み方）" else ""}")
+                    useEis = cached
+                    done = true
+                } else {
+                    tried.add("${tag(cached)}=束ねられない")
                 }
-                lastBound = e
-                val size = videoSize(v)
-                val short = size?.let { minOf(it.width, it.height) } ?: 0
-                tried.add("${tag(e)}=${size?.let { sizeLabel(it) } ?: "不明"}")
-                if (short > bestShort) {
-                    bestShort = short
-                    bestEis = e
-                }
-                if (short >= wantShort || size == null) break
             }
-            if (bestEis >= 0) {
-                if (bestEis != lastBound) rebindAndWait(BindSpec(newRecorder(want), still, bestEis))
-                Prefs.setPlanEis(this, facingValue, quality, still, bestEis)
+            if (!done && stabOn) {
+                val modes = availableStabModes()
+                val eis0 = chooseEisMode() ?: 0
+                val plans = ArrayList<Int>()
+                fun add(e: Int) {
+                    if (!plans.contains(e) && e != cached) plans.add(e)
+                }
+                add(eis0)
+                if (eis0 == 2 && modes.contains(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)) add(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)
+                add(0)
+                var bestEis = -1
+                var bestShort = -1
+                var lastBound = -1
+                for (e in plans) {
+                    rebindAndWait(BindSpec(newRecorder(want, bitrate30), still, e))
+                    val v = videoCapture
+                    if (v == null) {
+                        tried.add("${tag(e)}=束ねられない")
+                        continue
+                    }
+                    lastBound = e
+                    val size = videoSize(v)
+                    val short = size?.let { minOf(it.width, it.height) } ?: 0
+                    tried.add("${tag(e)}=${size?.let { sizeLabel(it) } ?: "不明"}")
+                    if (short > bestShort) {
+                        bestShort = short
+                        bestEis = e
+                    }
+                    if (short >= wantShort || size == null) break
+                }
+                if (bestEis >= 0) {
+                    if (bestEis != lastBound) rebindAndWait(BindSpec(newRecorder(want, bitrate30), still, bestEis))
+                    Prefs.setPlanEis(this, facingValue, quality, still, bestEis)
+                    useEis = bestEis
+                }
             }
         }
-        Log.i(TAG, "録画の組み方（頼んだ短辺 $wantShort）: ${tried.joinToString(" / ")}")
-        val vc = videoCapture
-        val resolution = vc?.let { v -> videoSize(v)?.let { sizeLabel(it) } } ?: ""
+        Log.i(TAG, "録画の組み方（頼んだ短辺 $wantShort・fps $wantFps・細かさ $level）: ${tried.joinToString(" / ")}")
+        var vc = videoCapture
+        var size = vc?.let { videoSize(it) }
+        // 目標のビットレートを出した画質（頼んだ画質より低い解像度で束ねられたら、その解像度に合わせ直す）
+        var bitrateQuality = want
+        if (vc != null && size != null && level != VideoTuning.STD && useEis >= 0) {
+            val short = minOf(size.width, size.height)
+            if (short < wantShort) {
+                bitrateQuality = qualityOfShort(short)
+                rebindAndWait(BindSpec(newRecorder(want, bitrateFor(bitrateQuality, level, useFps)), still, useEis, useFps))
+                vc = videoCapture
+                size = vc?.let { videoSize(it) }
+                tried.add("細かさを実際の解像度（短辺 $short）に合わせて束ね直し")
+            }
+        }
+        val resolution = size?.let { sizeLabel(it) } ?: ""
+        val targetBps = if (vc != null) bitrateFor(bitrateQuality, level, useFps) ?: 0 else 0
+        val tuning = Tuning(wantFps, level, useFps, targetBps, fpsNote)
         recordResLabel = if (vc != null) {
-            "${resolution.ifEmpty { "不明" }}（頼んだ画質 $quality。試した組み方: ${tried.joinToString(" / ")}）"
+            "${resolution.ifEmpty { "不明" }}・${useFps}fps・細かさ ${VideoTuning.label(level)}${if (targetBps > 0) "（目標 ${VideoTuning.mbpsLabel(targetBps.toLong())}）" else ""}" +
+                "（頼んだ画質 $quality・fps $wantFps${if (fpsNote.isNotEmpty()) "：$fpsNote" else ""}。試した組み方: ${tried.joinToString(" / ")}）"
         } else {
             "録画できません（${tried.joinToString(" / ")}）"
         }
@@ -1831,7 +2255,7 @@ class CameraService : LifecycleService(), CameraController {
             }
             throw IllegalStateException("$reason${if (notes.isNotEmpty()) "（$notes）" else ""}")
         }
-        return resolution
+        return Bound(resolution, tuning)
     }
 
     // ── 録画：1 本ずつの録り始め・保存 ──
@@ -2010,7 +2434,7 @@ class CameraService : LifecycleService(), CameraController {
     }
 
     // ── 録画：準備 ──
-    override fun prepare(quality: String, audio: Boolean, still: Boolean, stopTempC: Double, off: Boolean) {
+    override fun prepare(quality: String, audio: Boolean, still: Boolean, stopTempC: Double, off: Boolean, fps: Int, bitrate: String) {
         synchronized(recordLock) {
             if (off) {
                 pendingArm = null
@@ -2021,7 +2445,7 @@ class CameraService : LifecycleService(), CameraController {
             }
             if (!running) throw IllegalStateException("カメラが起動していません")
             if (!cancelStop("録画の準備")) throw IllegalStateException("コンパニオンを止めています（動画の書き出しが済むと止まります）")
-            val req = ArmRequest(quality, audio, still, stopTempC)
+            val req = ArmRequest(quality, audio, still, stopTempC, VideoTuning.fpsOf(fps), VideoTuning.levelOf(bitrate))
             lastArm = req
             if (session != null) {
                 // 録画中：録画が終わってから準備し直す
@@ -2036,18 +2460,18 @@ class CameraService : LifecycleService(), CameraController {
 
     private fun armLocked(req: ArmRequest) {
         val a = armed
-        if (a != null && a.quality == req.quality && a.still == req.still && a.facing == facingValue && videoCapture != null) {
+        if (a != null && a.sameAs(req.quality, req.still, req.fps, req.bitrate, facingValue) && videoCapture != null) {
             // 組み方は同じ。音声の有無が変わったなら録りためだけ録り直す
             if (a.audio != req.audio) stopBufferLocked()
-            armed = ArmedConfig(req.quality, req.audio, req.still, facingValue, req.stopTempC, a.resolution)
+            armed = ArmedConfig(req.quality, req.audio, req.still, facingValue, req.stopTempC, a.resolution, a.tuning)
             requestBufferStart()
             return
         }
         stopBufferLocked()
         armed = null
-        val res = bindForRecordingLocked(req.quality, req.still)
-        armed = ArmedConfig(req.quality, req.audio, req.still, facingValue, req.stopTempC, res)
-        Log.i(TAG, "録画の準備ができました（${req.quality} $res・音声 ${req.audio}・撮影 ${req.still}）")
+        val b = bindForRecordingLocked(req.quality, req.still, req.fps, req.bitrate)
+        armed = ArmedConfig(req.quality, req.audio, req.still, facingValue, req.stopTempC, b.resolution, b.tuning)
+        Log.i(TAG, "録画の準備ができました（${req.quality} ${b.resolution}・${b.tuning.fps}fps・細かさ ${b.tuning.bitrateLevel}・音声 ${req.audio}・撮影 ${req.still}）")
         bufRetryAt = 0
         bufError = null
         requestBufferStart()
@@ -2091,6 +2515,19 @@ class CameraService : LifecycleService(), CameraController {
         try {
             startRecLocked(vc, rec)
         } catch (e: Exception) {
+            if (a.tuning.fps == 60) {
+                // 60fps の組み方では録り始められない：30fps の組み方に戻して、録りためをやり直す
+                try {
+                    val b = downgrade60Locked(a.quality, a.still, a.tuning.bitrateLevel, e.message ?: e.javaClass.simpleName)
+                    armed = ArmedConfig(a.quality, a.audio, a.still, a.facing, a.stopTempC, b.resolution, b.tuning)
+                    bufRetryAt = 0
+                    requestBufferStart()
+                    refreshNotification()
+                    return
+                } catch (e2: Exception) {
+                    Log.w(TAG, "30fps への戻しに失敗", e2)
+                }
+            }
             bufError = e.message ?: e.javaClass.simpleName
             bufRetryAt = now + 30_000
             Log.w(TAG, "遡り録画の録りためを始められません: $bufError")
@@ -2214,7 +2651,25 @@ class CameraService : LifecycleService(), CameraController {
             segment = s.segment,
             preRollMs = s.preRoll?.plan?.preRollMs ?: 0L,
             bytesPerSec = rate,
+            fps = s.tuning.fps,
+            fpsWanted = s.tuning.fpsWanted,
+            fpsNote = s.tuning.fpsNote,
+            bitrate = s.tuning.bitrate,
+            bitrateLevel = s.tuning.bitrateLevel,
         )
+    }
+
+    /** いまの 1 本を録り始めた：カメラから届いた枚数と時刻を控える（実測の fps を出すため） */
+    private fun beginSegFps(s: Session) {
+        s.segFrames0 = sensorFrames.get()
+        s.segStartAt = SystemClock.elapsedRealtime()
+        s.segFps = 0.0
+    }
+
+    /** いまの 1 本を止める直前に呼ぶ：録っている間にカメラから届いた fps の平均を控える */
+    private fun markSegFps(s: Session) {
+        val ms = SystemClock.elapsedRealtime() - s.segStartAt
+        s.segFps = if (s.segStartAt > 0L && ms >= 500L) (sensorFrames.get() - s.segFrames0) * 1000.0 / ms else 0.0
     }
 
     override fun startRecording(o: StartOptions): RecordingState {
@@ -2227,14 +2682,16 @@ class CameraService : LifecycleService(), CameraController {
             val thumb = latestFrame?.bytes
             val withAudio = o.audio && audioPermitted
             var a = armed
-            if (a != null && !(a.quality == o.quality && a.still == o.still && a.facing == facingValue && videoCapture != null)) {
+            val oFps = VideoTuning.fpsOf(o.fps)
+            val oBitrate = VideoTuning.levelOf(o.bitrate)
+            if (a != null && !(a.sameAs(o.quality, o.still, oFps, oBitrate, facingValue) && videoCapture != null)) {
                 // 準備と違う頼み方：静止画なし（G2 録画）なら頼まれた組み方で準備し直し、静止画あり（G2 カメラ）なら準備を解く
                 stopBufferLocked()
                 armed = null
                 a = null
                 if (!o.still) {
-                    val res = bindForRecordingLocked(o.quality, o.still)
-                    val na = ArmedConfig(o.quality, o.audio, o.still, facingValue, o.stopTempC, res)
+                    val b = bindForRecordingLocked(o.quality, o.still, oFps, oBitrate)
+                    val na = ArmedConfig(o.quality, o.audio, o.still, facingValue, o.stopTempC, b.resolution, b.tuning)
                     armed = na
                     a = na
                 }
@@ -2256,29 +2713,51 @@ class CameraService : LifecycleService(), CameraController {
                 bufCur = null
                 bufPrev = null
                 cur.sessionTapAt = tapAt
-                s = Session(o, tapAt, withAudio, armedNow.resolution, imageAnalysis != null, imageCapture != null, cur, PreRollUse(if (plan.prevUse) prev else null, plan), name)
+                s = Session(o, tapAt, withAudio, armedNow.resolution, imageAnalysis != null, imageCapture != null, cur, PreRollUse(if (plan.prevUse) prev else null, plan), name, armedNow.tuning)
                 Log.i(TAG, "録画開始 $name（遡り ${plan.preRollMs}ms：前の切れ端 ${if (plan.prevUse) "${plan.prevFromMs}ms から" else "使わない"}・今の切れ端 ${plan.curFromMs}ms から）")
             } else {
                 stopBufferLocked()
-                val resolution = armedNow?.resolution ?: bindForRecordingLocked(o.quality, o.still)
-                val vc = videoCapture ?: throw IllegalStateException("録画を開始できません（構成=$boundLabel）")
-                val rec = newDestinationRec(name, withAudio)
+                var bound = if (armedNow != null) Bound(armedNow.resolution, armedNow.tuning) else bindForRecordingLocked(o.quality, o.still, oFps, oBitrate)
+                var vc = videoCapture ?: throw IllegalStateException("録画を開始できません（構成=$boundLabel）")
+                var rec = newDestinationRec(name, withAudio)
                 try {
                     startRecLocked(vc, rec)
                 } catch (e: Exception) {
-                    if (armedNow == null) {
+                    var retried = false
+                    if (bound.tuning.fps == 60) {
+                        // 60fps の組み方では録り始められない：30fps の組み方に戻して、もう一度だけ試す
                         try {
-                            rebindAndWait(null)
-                        } catch (_: Exception) {
+                            bound = downgrade60Locked(o.quality, o.still, oBitrate, e.message ?: e.javaClass.simpleName)
+                            if (armedNow != null) {
+                                armed = ArmedConfig(armedNow.quality, armedNow.audio, armedNow.still, armedNow.facing, armedNow.stopTempC, bound.resolution, bound.tuning)
+                            }
+                            vc = videoCapture ?: throw IllegalStateException("録画を開始できません（構成=$boundLabel）")
+                            rec = newDestinationRec(name, withAudio)
+                            startRecLocked(vc, rec)
+                            retried = true
+                        } catch (e2: Exception) {
+                            Log.w(TAG, "30fps でのやり直しに失敗", e2)
                         }
                     }
-                    throw e
+                    if (!retried) {
+                        if (armedNow == null) {
+                            try {
+                                rebindAndWait(null)
+                            } catch (_: Exception) {
+                            }
+                        }
+                        throw e
+                    }
                 }
                 rec.sessionTapAt = tapAt
-                s = Session(o, tapAt, withAudio, resolution, imageAnalysis != null, imageCapture != null, rec, null, name)
-                Log.i(TAG, "録画開始 $name（音声 $withAudio・配信 ${s.live}・撮影 ${s.capture}・解像度 $resolution・準備 ${armedNow != null}）")
+                s = Session(o, tapAt, withAudio, bound.resolution, imageAnalysis != null, imageCapture != null, rec, null, name, bound.tuning)
+                Log.i(
+                    TAG,
+                    "録画開始 $name（音声 $withAudio・配信 ${s.live}・撮影 ${s.capture}・解像度 ${bound.resolution}・${bound.tuning.fps}fps・細かさ ${bound.tuning.bitrateLevel}・準備 ${armedNow != null}）",
+                )
             }
             s.thumb = thumb
+            beginSegFps(s)
             session = s
             recordingLabel = "0:00"
             scheduleSessionTimerLocked(s)
@@ -2321,6 +2800,7 @@ class CameraService : LifecycleService(), CameraController {
         val old = s.current
         // 次のファイル（選んだフォルダなら書き込み先も）を先に作っておき、止めてから始めるまでの欠けを短くする
         val next = newDestinationRec(newVideoName(), s.audio)
+        markSegFps(s)
         old.stopAt = SystemClock.elapsedRealtime()
         try {
             old.recording?.stop()
@@ -2356,6 +2836,7 @@ class CameraService : LifecycleService(), CameraController {
         s.finishedBytes += r.bytes
         s.current = next
         s.segment += 1
+        beginSegFps(s)
         s.thumb = latestFrame?.bytes
         scheduleSessionTimerLocked(s)
         refreshNotification()
@@ -2384,6 +2865,7 @@ class CameraService : LifecycleService(), CameraController {
                     name = name, uri = null, durationMs = dur, bytes = (rate * dur).toLong(), audio = s.audio,
                     thumbnail = s.thumb, error = listOfNotNull(note, saveError).joinToString("。").ifEmpty { null },
                     resolution = s.resolution, preRollMs = pre.plan.preRollMs, pending = true, segment = s.segment,
+                    fps = s.tuning.fps, measuredFps = s.segFps, bitrate = s.tuning.bitrate, bitrateLevel = s.tuning.bitrateLevel, fpsNote = s.tuning.fpsNote,
                 )
             }
             parts.forEach { it.file.delete() }
@@ -2391,6 +2873,7 @@ class CameraService : LifecycleService(), CameraController {
                 name = name, uri = null, durationMs = dur, bytes = 0L, audio = s.audio, thumbnail = s.thumb,
                 error = listOfNotNull(note, "録画を保存できませんでした").joinToString("。"), resolution = s.resolution,
                 segment = s.segment,
+                fps = s.tuning.fps, measuredFps = s.segFps, bitrate = s.tuning.bitrate, bitrateLevel = s.tuning.bitrateLevel, fpsNote = s.tuning.fpsNote,
             )
         }
         val ev = rec.finalizeEvent
@@ -2405,6 +2888,7 @@ class CameraService : LifecycleService(), CameraController {
             name = name, uri = uri, durationMs = rec.durationMs, bytes = rec.bytes, audio = s.audio,
             thumbnail = s.thumb, error = listOfNotNull(note, error).joinToString("。").ifEmpty { null },
             resolution = s.resolution, preRollMs = 0L, pending = false, segment = s.segment,
+            fps = s.tuning.fps, measuredFps = s.segFps, bitrate = s.tuning.bitrate, bitrateLevel = s.tuning.bitrateLevel, fpsNote = s.tuning.fpsNote,
         )
     }
 
@@ -2414,11 +2898,16 @@ class CameraService : LifecycleService(), CameraController {
         s.timer?.let { mainHandler.removeCallbacks(it) }
         s.timer = null
         val rec = s.current
+        markSegFps(s)
         stopRecWait(rec, 30)
         session = null
         recordingLabel = null
         val r = finishSegmentLocked(s, rec, note)
-        Log.i(TAG, "録画終了 ${r.name} ${r.durationMs}ms ${r.bytes}B 遡り ${r.preRollMs}ms 書き出し中 ${r.pending} uri=${r.uri} error=${r.error}")
+        Log.i(
+            TAG,
+            "録画終了 ${r.name} ${r.durationMs}ms ${r.bytes}B（平均 ${fmt1(VideoTuning.mbpsOf(r.bytes, r.durationMs))}Mbps・実測 ${fmt1(r.measuredFps)}fps）" +
+                " 遡り ${r.preRollMs}ms 書き出し中 ${r.pending} uri=${r.uri} error=${r.error}",
+        )
         refreshNotification()
         afterSessionLocked(rebind)
         return r

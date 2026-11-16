@@ -25,6 +25,7 @@ object Prefs {
     private const val KEY_LOW_LIGHT = "lowLightAuto"
     private const val KEY_LOW_LIGHT_NIGHT = "lowLightNight"
     private const val KEY_LOW_LIGHT_VIDEO = "lowLightVideo"
+    private const val KEY_LOW_LIGHT_VIDEO_MIN = "lowLightVideoMin"
     private const val KEY_LOW_LIGHT_LEVEL = "lowLightLevel"
 
     private fun sp(context: Context) = context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
@@ -183,10 +184,22 @@ object Prefs {
     }
 
     /** 録画も暗いときは明るさを優先する（暗いほど fps が下がる。最低 7fps）。利用者の選択で既定オン */
-    fun lowLightVideo(context: Context): Boolean = sp(context).getBoolean(KEY_LOW_LIGHT_VIDEO, true)
+    /** 録画も暗いときは明るさを優先するか（0.1.20 からは下限の選択。下げない = false） */
+    fun lowLightVideo(context: Context): Boolean = lowLightVideoMin(context) != 0
 
-    fun setLowLightVideo(context: Context, value: Boolean) {
-        sp(context).edit().putBoolean(KEY_LOW_LIGHT_VIDEO, value).apply()
+    /**
+     * 暗いときの録画の fps の下限（0.1.20）：7 = 明るさ優先（既定）、15 = バランス、0 = 下げない。
+     * まだ選んでいなければ、0.1.19 の「録画も明るさ優先」のオン/オフから決める
+     */
+    fun lowLightVideoMin(context: Context): Int {
+        val p = sp(context)
+        if (!p.contains(KEY_LOW_LIGHT_VIDEO_MIN)) return if (p.getBoolean(KEY_LOW_LIGHT_VIDEO, true)) LowLight.RECORDING_MIN_FPS else 0
+        return LowLight.videoMinOf(p.getInt(KEY_LOW_LIGHT_VIDEO_MIN, LowLight.RECORDING_MIN_FPS))
+    }
+
+    fun setLowLightVideoMin(context: Context, value: Int) {
+        val v = LowLight.videoMinOf(value)
+        sp(context).edit().putInt(KEY_LOW_LIGHT_VIDEO_MIN, v).putBoolean(KEY_LOW_LIGHT_VIDEO, v != 0).apply()
     }
 
     /** 暗いとみなす明るさの段階（0 = 早め、1 = ふつう、2 = 遅め。LowLight.LEVELS） */
@@ -213,5 +226,25 @@ object Prefs {
 
     fun setPlanEis(context: Context, facing: String, quality: String, still: Boolean, eis: Int) {
         sp(context).edit().putInt(planKey(facing, quality, still), eis).apply()
+    }
+
+    /**
+     * 60fps の組み方の記憶（0.1.20）：向き・画質・静止画の有無・手ブレ補正の設定ごとに、60fps が通った手ブレ補正のモード（0〜2）。
+     * 通らなかったことは覚えない（その場かぎりの理由かもしれないので、サービスを始め直したら確かめ直す）
+     */
+    fun plan60Key(facing: String, quality: String, still: Boolean, stabOn: Boolean) =
+        "plan60:$facing:$quality:${if (still) "s" else "n"}:${if (stabOn) "stab" else "nostab"}"
+
+    fun plan60(context: Context, key: String): Int? {
+        val v = sp(context).getInt(key, -1)
+        return if (v in 0..2) v else null
+    }
+
+    fun setPlan60(context: Context, key: String, eis: Int) {
+        sp(context).edit().putInt(key, eis).apply()
+    }
+
+    fun clearPlan60(context: Context, key: String) {
+        sp(context).edit().remove(key).apply()
     }
 }

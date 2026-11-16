@@ -44,22 +44,38 @@ object LowLight {
         override fun toString(): String = "$lower〜$upper"
     }
 
-    /** 録画の下限（これより遅くするとカクつきすぎる）と、写真・メガネの映像の下限 */
+    /** 録画の下限（明るさ優先。これより遅くするとカクつきすぎる）・バランスのときの下限と、写真・メガネの映像の下限 */
     const val RECORDING_MIN_FPS = 7
+    const val RECORDING_BALANCED_FPS = 15
     const val STILL_MIN_FPS = 5
+
+    /** 設定の値（暗いときの録画の fps の下限）を揃える：0 = 下げない、15 = バランス、それ以外 = 明るさ優先（7） */
+    fun videoMinOf(v: Int): Int = when (v) {
+        0 -> 0
+        RECORDING_BALANCED_FPS -> RECORDING_BALANCED_FPS
+        else -> RECORDING_MIN_FPS
+    }
+
+    fun videoMinLabel(v: Int): String = when (videoMinOf(v)) {
+        0 -> "fps を下げない"
+        RECORDING_BALANCED_FPS -> "バランス（15fps まで）"
+        else -> "明るさ優先（7fps まで）"
+    }
 
     /**
      * 暗いときの AE の fps 範囲を選ぶ。下限が低いほど 1 コマの露光を長くできる（明るく、ノイズが減る）。
-     * recording（録画中・録画の準備中）：上限は端末の 30 以下の一番上（ふつう 30）を保ち、下限は 7 まで。
+     * recording（録画中・録画の準備中）：上限は端末の 30 以下の一番上（ふつう 30）を保ち、下限は recordingMin まで
+     * （明るさ優先 7・バランス 15。0.1.20 から選べる。60fps で録っているときも、暗い間は 30fps 以下に下げる）。
      * それ以外（写真・メガネの映像）：上限 30 以下で下限が一番低いもの（下限は 5 まで。同じなら上限の低い方 = 負荷が軽い）。
      * 使えるものが無ければ null（fps は変えない）
      */
-    fun pickRange(ranges: List<FpsRange>, recording: Boolean): FpsRange? {
+    fun pickRange(ranges: List<FpsRange>, recording: Boolean, recordingMin: Int = RECORDING_MIN_FPS): FpsRange? {
         val usable = ranges.filter { it.upper <= 30 && it.lower in 1 until it.upper }
         if (recording) {
+            val floor = recordingMin.coerceAtLeast(1)
             val top = usable.maxOfOrNull { it.upper } ?: return null
-            return usable.filter { it.upper == top && it.lower >= RECORDING_MIN_FPS }.minByOrNull { it.lower }
-                ?: usable.filter { it.lower >= RECORDING_MIN_FPS }
+            return usable.filter { it.upper == top && it.lower >= floor }.minByOrNull { it.lower }
+                ?: usable.filter { it.lower >= floor }
                     .minWithOrNull(compareBy<FpsRange> { it.lower }.thenByDescending { it.upper })
         }
         return usable.filter { it.lower >= STILL_MIN_FPS }

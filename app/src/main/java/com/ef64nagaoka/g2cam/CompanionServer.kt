@@ -38,6 +38,14 @@ class RecordingState(
     val preRollMs: Long,
     /** いまの書き込みの速さ（バイト/秒。分からなければ 0） */
     val bytesPerSec: Long,
+    /** 録っている fps（束ねた組み方の目標。30 か 60）と、頼まれた fps（0.1.20） */
+    val fps: Int = 30,
+    val fpsWanted: Int = 30,
+    /** 60fps を頼まれたのに使えなかったときの理由（使えていれば空） */
+    val fpsNote: String = "",
+    /** 目標のビットレート（bps。0 = 端末の標準のまま）と、頼まれた段階（std / high / max） */
+    val bitrate: Int = 0,
+    val bitrateLevel: String = VideoTuning.STD,
 )
 
 /** 録画の結果 */
@@ -59,6 +67,14 @@ data class RecordResult(
     val pending: Boolean = false,
     /** 区切り録画の何本目か */
     val segment: Int = 1,
+    /** 録った fps（束ねた組み方の目標。分からなければ 0）と、録っている間にカメラから届いた fps の平均（実測。分からなければ 0） */
+    val fps: Int = 0,
+    val measuredFps: Double = 0.0,
+    /** 目標のビットレート（bps。0 = 端末の標準のまま）と、頼まれた段階 */
+    val bitrate: Int = 0,
+    val bitrateLevel: String = VideoTuning.STD,
+    /** 60fps を頼まれたのに使えなかったときの理由 */
+    val fpsNote: String = "",
 )
 
 /** /record/start の頼み方 */
@@ -75,6 +91,10 @@ class StartOptions(
     val stopTempC: Double,
     /** 空き容量がこれを切ったら保存して止める（バイト） */
     val minFreeBytes: Long,
+    /** 録画の fps（30 か 60。0.1.20）。60 は、選んだ画質のまま・手ブレ補正を弱めずに使えるときだけ */
+    val fps: Int = 30,
+    /** 録画の細かさ（std / high / max。0.1.20） */
+    val bitrate: String = VideoTuning.STD,
 )
 
 /** このアプリ自身の負荷と配信の様子（/status 用。adb が使えない端末で原因を見るため） */
@@ -115,6 +135,18 @@ class LowLightInfo(
     val lastCaptureMode: String,
     /** 暗いとみなす段階（0 早め・1 ふつう・2 遅め） */
     val level: Int,
+    /** 暗いときの録画の fps の下限（7 明るさ優先・15 バランス・0 下げない。0.1.20） */
+    val videoMin: Int = LowLight.RECORDING_MIN_FPS,
+)
+
+/** レンズとズームの様子（/status 用。0.1.20） */
+class LensStatus(
+    /** 端末のレンズ（倍率の小さい順）。分からなければ空 */
+    val lenses: List<LensInfo.Lens>,
+    /** いまのズームの様子（使っているレンズ・デジタルの拡大率・光学かどうか。分からなければ null） */
+    val state: LensInfo.ZoomState,
+    /** 説明（分からないときの理由も） */
+    val note: String,
 )
 
 /** 遡り録画の状態（/status 用） */
@@ -173,11 +205,20 @@ interface CameraController {
      * 録画の準備（G2 録画が開いたとき・設定を変えたときに呼ぶ）。待機中から録画できる組み方にしておき、
      * 遡り録画がオンなら切れ端を録り始める。off なら準備をやめて通常（配信＋撮影）に戻す
      */
-    fun prepare(quality: String, audio: Boolean, still: Boolean, stopTempC: Double, off: Boolean)
+    fun prepare(quality: String, audio: Boolean, still: Boolean, stopTempC: Double, off: Boolean, fps: Int = 30, bitrate: String = VideoTuning.STD)
     /** 準備した録画の画質（uhd など。準備していなければ null） */
     val armedQuality: String?
     /** 準備した録画の解像度（例 3840x2160。準備していない・分からなければ空） */
     val armedResolution: String
+    /** 準備した録画の fps（束ねた組み方の目標）・頼まれた fps・60fps が使えなかった理由・頼まれた細かさ（0.1.20。準備していなければ 0 / 空） */
+    val armedFps: Int
+    val armedFpsWanted: Int
+    val armedFpsNote: String
+    val armedBitrate: String
+    /** カメラから届いている fps（実測。撮影結果の数。分からなければ 0） */
+    val sensorFps: Double
+    /** レンズとズームの様子（0.1.20） */
+    val lensStatus: LensStatus
     /** 録画の準備を休んでいる理由（"heat"）。休んでいなければ null。G2 録画はこの間、準備を頼み直さない */
     val armPausedReason: String?
     /** 高温の判定（コンパニオンの画面で選んだもの）：止める温度（0 = G2 アプリに従う・-1 = 温度では止めない）・止める発熱の段階・熱いとみなす段階（0 = 使わない） */
@@ -299,6 +340,8 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
                     still = body.optBoolean("still", false),
                     stopTempC = body.optDouble("stopTempC", 0.0).let { if (it.isNaN()) 0.0 else it },
                     off = body.optBoolean("off", false),
+                    fps = VideoTuning.fpsOf(body.optInt("fps", 30)),
+                    bitrate = VideoTuning.levelOf(body.optString("bitrate", VideoTuning.STD)),
                 )
                 json(Response.Status.OK, statusJson())
             }
@@ -315,6 +358,8 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
                         continuous = body.optBoolean("continuous", false),
                         stopTempC = body.optDouble("stopTempC", 0.0).let { if (it.isNaN()) 0.0 else it },
                         minFreeBytes = body.optLong("minFreeMb", 300L).coerceAtLeast(0L) * 1024L * 1024L,
+                        fps = VideoTuning.fpsOf(body.optInt("fps", 30)),
+                        bitrate = VideoTuning.levelOf(body.optString("bitrate", VideoTuning.STD)),
                     ),
                 )
                 json(Response.Status.OK, statusJson())
@@ -372,6 +417,11 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
             .put("preRollMs", r.preRollMs)
             .put("pending", r.pending)
             .put("segment", r.segment)
+            .put("fps", r.fps)
+            .put("measuredFps", Math.round(r.measuredFps * 10) / 10.0)
+            .put("bitrate", r.bitrate)
+            .put("bitrateLevel", r.bitrateLevel)
+            .put("fpsNote", r.fpsNote)
         r.thumbnail?.let { j.put("thumbnailBase64", Base64.encodeToString(it, Base64.NO_WRAP)) }
         return j
     }
@@ -390,10 +440,16 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
             .put("zoomMax", camera.zoomMax.toDouble())
             .put("canRecord", true)
             .put("canPrepare", true)
+            .put("canTune", true)
             .put("audioPermitted", camera.audioPermitted)
             .put("armed", camera.armedQuality != null)
             .put("armedQuality", camera.armedQuality ?: JSONObject.NULL)
             .put("armedResolution", camera.armedResolution)
+            .put("armedFps", camera.armedFps)
+            .put("armedFpsWanted", camera.armedFpsWanted)
+            .put("armedFpsNote", camera.armedFpsNote)
+            .put("armedBitrate", camera.armedBitrate)
+            .put("sensorFps", Math.round(camera.sensorFps * 10) / 10.0)
             .put("armPaused", camera.armPausedReason ?: JSONObject.NULL)
             .put("cameraOpen", camera.cameraOpen)
             .put("heatStopTemp", camera.heatStopTemp)
@@ -414,7 +470,21 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
                 .put("recordSegment", r.segment)
                 .put("recordPreRollMs", r.preRollMs)
                 .put("recordBytesPerSec", r.bytesPerSec)
+                .put("recordFps", r.fps)
+                .put("recordFpsWanted", r.fpsWanted)
+                .put("recordFpsNote", r.fpsNote)
+                .put("recordBitrate", r.bitrate)
+                .put("recordBitrateLevel", r.bitrateLevel)
         }
+        val ls = camera.lensStatus
+        val lensArr = JSONArray()
+        for (l in ls.lenses) lensArr.put(JSONObject().put("id", l.id).put("ratio", l.ratio).put("name", l.name))
+        j.put("lenses", lensArr)
+            .put("lensNote", ls.note)
+            .put("lensActive", ls.state.lens?.id ?: JSONObject.NULL)
+            .put("lensActiveName", ls.state.lens?.name ?: JSONObject.NULL)
+            .put("zoomOptical", ls.state.optical ?: JSONObject.NULL)
+            .put("zoomDigital", ls.state.digital ?: JSONObject.NULL)
         val li = camera.loadInfo
         j.put("cpuPct", li.cpuPct)
             .put("cpuAvgPct", li.cpuAvgPct)
@@ -431,6 +501,7 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
             .put("lowLightNight", ll.night)
             .put("lowLightNightOn", ll.nightOn)
             .put("lowLightVideo", ll.video)
+            .put("lowLightVideoMin", ll.videoMin)
             .put("lowLightRange", ll.range)
             .put("lowLightLevel", ll.level)
             .put("lastCaptureMode", ll.lastCaptureMode)

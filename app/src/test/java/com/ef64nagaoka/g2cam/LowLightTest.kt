@@ -150,6 +150,32 @@ class LowLightTest {
     }
 
     @Test
+    fun pickRangeForRecordingFollowsTheFloor() {
+        val ranges = listOf(r(15, 15), r(7, 15), r(15, 30), r(7, 30), r(30, 30), r(60, 60))
+        // バランス（0.1.20）：下限 15 まで。上限 30 は保つ
+        assertEquals(r(15, 30), LowLight.pickRange(ranges, recording = true, recordingMin = LowLight.RECORDING_BALANCED_FPS))
+        // 明るさ優先（既定）
+        assertEquals(r(7, 30), LowLight.pickRange(ranges, recording = true, recordingMin = LowLight.RECORDING_MIN_FPS))
+        // バランスで選べる範囲が無い端末（7〜30 と 30 固定だけ）：fps は変えない
+        assertNull(LowLight.pickRange(listOf(r(7, 30), r(30, 30)), recording = true, recordingMin = 15))
+        // 15 より上の下限しか無ければ、その中で一番低いもの
+        assertEquals(r(20, 30), LowLight.pickRange(listOf(r(20, 30), r(24, 30), r(7, 15)), recording = true, recordingMin = 15))
+        // 写真・メガネの映像には、録画の下限は関係ない
+        assertEquals(r(7, 15), LowLight.pickRange(ranges, recording = false, recordingMin = 15))
+    }
+
+    @Test
+    fun videoMinValues() {
+        assertEquals(7, LowLight.videoMinOf(7))
+        assertEquals(15, LowLight.videoMinOf(15))
+        assertEquals(0, LowLight.videoMinOf(0))
+        // 知らない値は明るさ優先（既定）
+        assertEquals(7, LowLight.videoMinOf(10))
+        assertEquals(7, LowLight.videoMinOf(-1))
+        assertEquals("fps を下げない", LowLight.videoMinLabel(0))
+    }
+
+    @Test
     fun pickRangeForStillsGoesLowest() {
         val ranges = listOf(r(15, 15), r(7, 15), r(15, 30), r(7, 30), r(30, 30))
         // 同じ下限なら上限の低い方（負荷が軽い）

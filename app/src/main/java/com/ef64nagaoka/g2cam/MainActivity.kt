@@ -409,15 +409,19 @@ class MainActivity : Activity() {
                 notifyPrefsChanged()
             }
         })
-        root.addView(CheckBox(this).apply {
-            text = "録画も暗いときは明るさを優先する（暗いほどフレームレートが下がり、最低 7fps 程度になります。切ると録画の fps は変えません）"
-            isChecked = Prefs.lowLightVideo(this@MainActivity)
-            setOnCheckedChangeListener { _, checked ->
-                Prefs.setLowLightVideo(this@MainActivity, checked)
-                AppLog.i("設定を変えました：録画も暗いときは明るさ優先 → ${if (checked) "オン" else "オフ"}")
-                notifyPrefsChanged()
-            }
-        })
+        addChoice(
+            root, "暗いときの録画の fps（下げるほど明るく録れるが、動くとブレやすい）",
+            listOf(
+                "明るさ優先（7fps まで下げる）（既定）",
+                "バランス（15fps まで。明るさはほどほど・動きのブレは少なめ）",
+                "fps を下げない（暗いまま録る。動きはなめらか）",
+            ),
+            intArrayOf(LowLight.RECORDING_MIN_FPS, LowLight.RECORDING_BALANCED_FPS, 0),
+            Prefs.lowLightVideoMin(this),
+        ) {
+            Prefs.setLowLightVideoMin(this, it)
+            notifyPrefsChanged()
+        }
         val levelValues = LowLight.LEVELS.indices.toList().toIntArray()
         addChoice(
             root, "暗いとみなす明るさ",
@@ -430,7 +434,8 @@ class MainActivity : Activity() {
         root.addView(TextView(this).apply {
             text = "・明るさはカメラの露出から見積もった目安です。上の「低照度」の行に、いまの明るさ（lux）が出ます\n" +
                 "・暗い状態が 1.5 秒続いたら切り替え、明るい状態が 3 秒続いたら戻します\n" +
-                "・夜景機能が使えるかは、カメラを開いたときに確かめて「低照度」の行に出します"
+                "・夜景機能が使えるかは、カメラを開いたときに確かめて「低照度」の行に出します\n" +
+                "・録画の細かさ（ビットレート）と 60fps は、G2 カメラ・G2 録画のスマホ画面の設定で選びます。実際の組み方は上の「録画の組み方」の行に出ます"
             textSize = 13f
             setPadding(0, dp(2), 0, dp(8))
         })
@@ -642,6 +647,9 @@ class MainActivity : Activity() {
                     ?: if (Prefs.lowLightAuto(this)) "オン（カメラが動いていません）" else "オフ"
                 ),
         )
+        // 0.1.20：レンズの倍率（光学の段）と、録画の組み方（実際の解像度・fps・細かさ）
+        CameraService.lensText()?.let { lines.add("レンズ：$it") }
+        CameraService.recordPlanText()?.let { lines.add("録画の組み方：${if (it.length > 160) it.take(160) + "…" else it}") }
         lines.add("カメラ権限：" + if (camera) "OK" else "未許可")
         lines.add("録画の音声（マイク）：" + if (mic) "OK" else "未許可（無音で録画。許可はアプリ情報から）")
         lines.add("電池の最適化の除外：" + if (battery) "OK" else "未設定（推奨）")
