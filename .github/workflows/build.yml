@@ -2,7 +2,7 @@ name: APK をビルド
 
 on:
   push:
-    branches: [main]
+    branches: [main, ci-probe]
   workflow_dispatch:
 
 permissions:
@@ -32,6 +32,14 @@ jobs:
           set -o pipefail
           gradle --no-daemon assembleDebug 2>&1 | tee build.log
 
+      # 遡り録画の区切りの計算（PreRollPlan）・低照度の判定（LowLight）など、端末の要らない試験。
+      # 落ちたら配布しない（0.1.19 から、配布より前に走らせる）
+      - name: 単体試験
+        run: |
+          set -o pipefail
+          echo "===== 単体試験 =====" >> build.log
+          gradle --no-daemon testDebugUnitTest 2>&1 | tee -a build.log
+
       - uses: actions/upload-artifact@v4
         with:
           name: g2cam-companion-debug
@@ -39,7 +47,9 @@ jobs:
 
       # 配布ページ（Releases）に版ごとの APK を置く。コンパニオンの「更新」と、いつでも最新を指す
       # https://github.com/ef641003/g2cam-companion/releases/latest/download/g2cam-companion.apk はここを見る
+      # 試しのビルド（main 以外のブランチで手動実行）では配布しない
       - name: 配布ページに APK を置く
+        if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -50,13 +60,6 @@ jobs:
           else
             gh release create "v$VER" g2cam-companion.apk --target "$GITHUB_SHA" --title "コンパニオン $VER" --notes "$(git log -1 --pretty=%s)" --latest
           fi
-
-      # 遡り録画の区切りの計算（PreRollPlan）など、端末の要らない試験。APK を置いてから走らせる
-      - name: 単体試験
-        run: |
-          set -o pipefail
-          echo "===== 単体試験 =====" >> build.log
-          gradle --no-daemon testDebugUnitTest 2>&1 | tee -a build.log
 
       # 失敗の原因を読めるよう、ビルドログを build-log ブランチに置く
       - name: ビルドログを build-log ブランチへ

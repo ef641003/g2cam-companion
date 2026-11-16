@@ -10,11 +10,18 @@ import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.graphics.ImageFormat
+import android.hardware.HardwareBuffer
+import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
+import android.media.ImageReader
 import android.net.Uri
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
@@ -24,7 +31,10 @@ import android.util.Log
 import android.util.Size
 import android.view.OrientationEventListener
 import android.view.Surface
+import androidx.camera.camera2.interop.Camera2CameraControl
+import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.interop.Camera2Interop
+import androidx.camera.camera2.interop.CaptureRequestOptions
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
@@ -32,6 +42,7 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
 import androidx.camera.core.UseCase
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
@@ -68,6 +79,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 import kotlin.math.max
+import kotlin.math.roundToInt
 
 /**
  * カメラを保持するフォアグラウンドサービス（種別 camera。録画の音声が許可されていれば microphone も）。
@@ -111,6 +123,10 @@ class CameraService : LifecycleService(), CameraController {
         private const val IDLE_CAMERA_MS = 20_000L
         /** 撮影のあと、静止画の拡張つきの組み方を保っておく時間 */
         private const val EXTENSION_KEEP_MS = 60_000L
+        /** 露出の値（暗さの判定）を読む間隔 */
+        private const val EXPOSURE_SAMPLE_MS = 250L
+        /** 夜景の拡張の表示名（extensionLabel） */
+        private const val NIGHT_LABEL = "夜景"
 
         @Volatile var running = false
         @Volatile var lastError: String? = null
@@ -130,6 +146,9 @@ class CameraService : LifecycleService(), CameraController {
 
         /** 画面表示用：遡り録画の状態（サービスが動いていなければ null） */
         fun preRollText(): String? = instance?.describePreRoll()
+
+        /** 画面表示用：低照度の状態（サービスが動いていなければ null） */
+        fun lowLightText(): String? = instance?.describeLowLight()
     }
 
     // ── CameraController ──
@@ -210,6 +229,35 @@ class CameraService : LifecycleService(), CameraController {
     @Volatile private var extensionAvailable: Boolean? = null
     @Volatile private var extensionWanted = false
     @Volatile private var lastCaptureAt = 0L
+
+    // ── 低照度（0.1.19）：露出の値から暗さを見て、暗いときは露光を長めにする（AE の fps 範囲の下限を下げる）。写真は夜景の拡張 ──
+    private val lowLightLock = Any()
+    private val lowLightDetector = LowLightDetector { Prefs.lowLightLevel(this) }
+    /** 直近の露出から見積もった明るさ（EV100。まだ無ければ NaN）と、その露出（表示用） */
+    @Volatile private var lowLightEv = Double.NaN
+    @Volatile private var exposureLabel = ""
+    @Volatile private var lastExposureAt = 0L
+    /** 結果に絞りが入っていない端末向けに、レンズの絞り（束ねたカメラの値） */
+    @Volatile private var defaultAperture = 1.8f
+    /** いま Camera2CameraControl で掛けている AE の fps 範囲（null = 掛けていない） */
+    @Volatile private var appliedLowLight: LowLight.FpsRange? = null
+    /** 夜景の拡張が使えるか（向きごと。無い = まだ確かめていない）。束ねられなかったときの理由 */
+    private val nightAvailable = ConcurrentHashMap<String, Boolean>()
+    private val nightBindFailed = ConcurrentHashMap<String, String>()
+    /** 撮影の前に夜景の拡張つきで束ねてほしい（bindCamera が読む）。いま夜景の拡張で束ねているか */
+    @Volatile private var nightWanted = false
+    @Volatile private var nightBound = false
+    @Volatile private var nightChecking = false
+    /** 直近の撮影の撮り方（night / lowlight / オート / HDR / normal） */
+    @Volatile private var lastCaptureMode = ""
+    /** 夜景の拡張でメガネへの配信を束ねられないときの、捨てるだけのプレビューの受け口 */
+    private var dummyThread: HandlerThread? = null
+
+    private val exposureCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+            onExposure(result)
+        }
+    }
     /** 録画の準備を高温で休んでいる（"heat"）。冷えたら lastArm で準備し直す */
     @Volatile private var armPaused: String? = null
     @Volatile private var lastArm: ArmRequest? = null
@@ -316,6 +364,62 @@ class CameraService : LifecycleService(), CameraController {
             extension = if (extensionBound) extensionLabel else "なし",
         )
 
+    override val lowLight: LowLightInfo
+        get() = LowLightInfo(
+            enabled = Prefs.lowLightAuto(this),
+            active = lowLightActive && camera != null && !cameraIdle,
+            ev = lowLightEv,
+            night = nightState(),
+            nightOn = Prefs.lowLightNight(this),
+            video = Prefs.lowLightVideo(this),
+            range = appliedLowLight?.let { "${it.lower}-${it.upper}" } ?: "",
+            lastCaptureMode = lastCaptureMode,
+            level = Prefs.lowLightLevel(this),
+        )
+
+    private val lowLightActive: Boolean get() = synchronized(lowLightLock) { lowLightDetector.active }
+
+    /** 夜景の拡張（いまの向き）：available / unavailable / failed / unknown */
+    private fun nightState(): String = when {
+        nightBindFailed.containsKey(facingValue) -> "failed"
+        nightAvailable[facingValue] == true -> "available"
+        nightAvailable[facingValue] == false -> "unavailable"
+        else -> "unknown"
+    }
+
+    private fun fmtLux(ev: Double): String {
+        if (ev.isNaN()) return "?"
+        val lux = LowLight.luxOf(ev)
+        return if (lux < 10) String.format(Locale.US, "%.1f", lux) else lux.roundToInt().toString()
+    }
+
+    /**
+     * 画面・診断用の低照度の説明。live = false なら、いまの明るさなど刻々と変わる値を入れない
+     * （診断の文は G2 アプリが変わるたびにログへ書くので、揺れる値を入れると溢れる）
+     */
+    fun describeLowLight(live: Boolean = true): String {
+        val on = Prefs.lowLightAuto(this)
+        val lv = LowLight.level(Prefs.lowLightLevel(this))
+        val open = camera != null && !cameraIdle
+        val now = when {
+            !open -> "カメラを閉じている"
+            lowLightEv.isNaN() -> "明るさを計測中"
+            else -> "${if (lowLightActive) "暗い" else "明るい"}（約 ${fmtLux(lowLightEv)} lux・EV ${String.format(Locale.US, "%.1f", lowLightEv)}${if (exposureLabel.isNotEmpty()) "・$exposureLabel" else ""}）"
+        }
+        val night = when (nightState()) {
+            "available" -> "使える"
+            "unavailable" -> "この端末には無い"
+            "failed" -> "束ねられない（${nightBindFailed[facingValue]}）"
+            else -> "未確認"
+        }
+        val applied = appliedLowLight?.let { "・露光を長めに（fps $it）" } ?: ""
+        return (if (on) "オン（判定 ${lv.label}：約 ${lv.enterLux.roundToInt()} lux 以下で暗い）" else "オフ") +
+            (if (live) "・いま $now$applied" else "") +
+            "・夜景の拡張 $night${if (!Prefs.lowLightNight(this)) "（使わない設定）" else ""}" +
+            "・録画は${if (Prefs.lowLightVideo(this)) "明るさ優先" else "そのまま"}" +
+            (if (live && lastCaptureMode.isNotEmpty()) "・直近の撮影=$lastCaptureMode" else "")
+    }
+
     /** このサービスで録画したファイル（名前 → URI）。/file で返すときに使う */
     private val recentFiles = ConcurrentHashMap<String, Uri>()
     /** 書き出し中（つなぎ合わせ中）の名前 → 済んだら開く門 */
@@ -350,6 +454,7 @@ class CameraService : LifecycleService(), CameraController {
         val a = armed
         val ready = if (a != null) "準備済み（${a.quality} ${a.resolution.ifEmpty { "解像度不明" }}${if (a.still) "・撮影あり" else ""}）" else if (armPaused != null) "休止中（高温）" else "なし"
         return "構成=${if (cameraIdle) "カメラを閉じている（待機）" else boundLabel}・静止画の拡張=$extensionLabel・手ブレ補正=$stabLabel・録画の解像度=$recordResLabel・録画の準備=$ready・保存先=${Storage.describe(this)}" +
+            "・低照度=${describeLowLight(live = false)}" +
             (if (bindNotes.isNotEmpty()) "・束ね直しの失敗=$bindNotes" else "")
     }
 
@@ -384,11 +489,13 @@ class CameraService : LifecycleService(), CameraController {
             ) {
                 closeCameraForIdle()
             }
-            // 撮影してしばらく経った：静止画の拡張つきの組み方から通常に戻す（拡張は待機中も重い）
-            if (extensionBound && extensionWanted && session == null && armed == null && !cameraIdle && !stopping &&
-                SystemClock.elapsedRealtime() - lastCaptureAt > EXTENSION_KEEP_MS && Prefs.extensionOnDemand(this@CameraService)
+            // 撮影してしばらく経った：静止画の拡張つき（夜景も）の組み方から通常に戻す（拡張は待機中も重い）
+            if (extensionBound && ((extensionWanted && Prefs.extensionOnDemand(this@CameraService)) || nightWanted) &&
+                session == null && armed == null && !cameraIdle && !stopping &&
+                SystemClock.elapsedRealtime() - lastCaptureAt > EXTENSION_KEEP_MS
             ) {
                 extensionWanted = false
+                nightWanted = false
                 postWork {
                     synchronized(recordLock) {
                         if (session == null && armed == null && extensionBound && !cameraIdle) {
@@ -463,7 +570,10 @@ class CameraService : LifecycleService(), CameraController {
                     return START_NOT_STICKY
                 }
                 refreshStreamInterval()
-                AppLog.i("配信の上限を ${Prefs.streamFps(this)}fps にしました")
+                AppLog.i("設定を反映しました（配信の上限 ${Prefs.streamFps(this)}fps・低照度 ${if (Prefs.lowLightAuto(this)) "オン" else "オフ"}）")
+                // 低照度の設定（オン/オフ・録画・判定の段階）もここで反映する
+                postWork { reconcileLowLight("設定を変えた") }
+                diagText = buildDiag()
                 return START_NOT_STICKY
             }
             ACTION_PREROLL_CHANGED -> {
@@ -540,6 +650,7 @@ class CameraService : LifecycleService(), CameraController {
         server = null
         wakeLock?.let { if (it.isHeld) it.release() }
         super.onDestroy() // カメラの unbind を先に済ませてから実行系を止める
+        dummyThread?.quitSafely()
         analysisExecutor.execute { frameEncoder.release() }
         analysisExecutor.shutdown()
         ioExecutor.shutdownNow()
@@ -625,6 +736,7 @@ class CameraService : LifecycleService(), CameraController {
             videoCapture = null
             frameLock.withLock { latestFrame = null }
             boundLabel = "停止中（書き出し待ち）"
+            forgetLowLightCamera()
         }
     }
 
@@ -735,6 +847,7 @@ class CameraService : LifecycleService(), CameraController {
             imageCapture = null
             videoCapture = null
             extensionBound = false
+            forgetLowLightCamera()
             frameLock.withLock { latestFrame = null }
             orientationListener?.disable()
             releaseWakeLock()
@@ -943,6 +1056,238 @@ class CameraService : LifecycleService(), CameraController {
         return null
     }
 
+
+    // ── 低照度（0.1.19） ──
+
+    /** 露出の値が届いた（カメラのスレッド）。間引いて暗さを判定し、変わったら露光の決め方を合わせる */
+    private fun onExposure(r: TotalCaptureResult) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastExposureAt < EXPOSURE_SAMPLE_MS) return
+        lastExposureAt = now
+        try {
+            val t = r.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: return
+            val iso = r.get(CaptureResult.SENSOR_SENSITIVITY) ?: return
+            val boost = r.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST)
+            val ap = r.get(CaptureResult.LENS_APERTURE)?.takeIf { it > 0f } ?: defaultAperture
+            val ev = LowLight.ev100(t, iso, boost, ap) ?: return
+            lowLightEv = ev
+            exposureLabel = "1/${max(1, (1e9 / t).roundToInt())} 秒・ISO ${iso * (boost ?: 100) / 100}"
+            val changed = synchronized(lowLightLock) { lowLightDetector.update(ev, now) }
+            if (changed != null) postWork { onLowLightChanged(changed) }
+        } catch (e: Exception) {
+            Log.w(TAG, "exposure read failed", e)
+        }
+    }
+
+    private fun onLowLightChanged(active: Boolean) {
+        val on = Prefs.lowLightAuto(this)
+        val lux = fmtLux(lowLightEv)
+        AppLog.i(
+            if (active) "暗くなりました（約 $lux lux）。${if (on) "低照度撮影にします" else "低照度の自動切り替えはオフです"}"
+            else "明るくなりました（約 $lux lux）。${if (on) "通常の撮影に戻します" else ""}",
+        )
+        reconcileLowLight(if (active) "暗くなった" else "明るくなった")
+        diagText = buildDiag()
+    }
+
+    /**
+     * 低照度の露光（AE の fps 範囲の下限を下げて、1 コマの露光を長くする）を、いまの状態に合わせる。
+     * 束ね直しのあと・暗さが変わったとき・設定を変えたときに呼ぶ。
+     * Camera2CameraControl の値はカメラ（向き）ごとに束ね直しても残るので、束ね直しのあとは force で必ず掛け直す
+     * （録画の組み方に、写真用の範囲が残らないように）
+     */
+    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
+    private fun reconcileLowLight(why: String, force: Boolean = false) {
+        synchronized(lowLightLock) {
+            val cam = camera ?: return
+            val recCtx = videoCapture != null || session != null || armed != null || bufCur != null
+            val want = desiredLowLightRange(cam, recCtx)
+            if (!force && want == appliedLowLight) return
+            try {
+                val c2 = Camera2CameraControl.from(cam.cameraControl)
+                if (want == null) {
+                    c2.clearCaptureRequestOptions()
+                } else {
+                    c2.setCaptureRequestOptions(
+                        CaptureRequestOptions.Builder()
+                            .setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, android.util.Range(want.lower, want.upper))
+                            .build(),
+                    )
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "low light control failed", e)
+                return
+            }
+            val prev = appliedLowLight
+            appliedLowLight = want
+            if (prev != want) {
+                AppLog.i(
+                    if (want != null) "低照度：露光を長めにしました（fps $want${if (recCtx) "・録画も明るさ優先" else ""}。$why）"
+                    else "低照度：露光を元に戻しました（$why）",
+                )
+            }
+        }
+    }
+
+    /** いま掛けたい AE の fps 範囲（lowLightLock の中で）。掛けないなら null */
+    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
+    private fun desiredLowLightRange(cam: Camera, recCtx: Boolean): LowLight.FpsRange? {
+        if (!Prefs.lowLightAuto(this) || !lowLightDetector.active) return null
+        // 端末の拡張（夜景・HDR など）が露出を受け持っている間は掛けない
+        if (extensionBound) return null
+        // 録画中・録画の準備中は、録画も明るさ優先にする設定のときだけ
+        if (recCtx && !Prefs.lowLightVideo(this)) return null
+        val ranges = try {
+            Camera2CameraInfo.from(cam.cameraInfo).getCameraCharacteristic(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+        } catch (e: Exception) {
+            null
+        } ?: return null
+        return LowLight.pickRange(ranges.map { LowLight.FpsRange(it.lower, it.upper) }, recCtx)
+    }
+
+    /** カメラを閉じた・手放した：表示用の値を消し、ならしをやり直す（暗いかどうかの判定は残す） */
+    private fun forgetLowLightCamera() {
+        synchronized(lowLightLock) {
+            lowLightDetector.reset()
+            appliedLowLight = null
+        }
+        lowLightEv = Double.NaN
+        exposureLabel = ""
+        nightBound = false
+        nightWanted = false
+    }
+
+    /** 撮影の前に夜景の拡張を使うか：暗い・設定オン・この向きで使える（または未確認）・束ねられなかったことがない */
+    private fun wantNightCapture(): Boolean =
+        Prefs.lowLightAuto(this) && Prefs.lowLightNight(this) && lowLightActive &&
+            nightAvailable[facingValue] != false && !nightBindFailed.containsKey(facingValue)
+
+    /** 夜景の拡張つきで束ねられる候補（使えなければ null） */
+    private fun nightSelector(ext: ExtensionsManager?, base: CameraSelector): CameraSelector? {
+        if (ext == null) return null
+        return try {
+            if (ext.isExtensionAvailable(base, ExtensionMode.NIGHT)) ext.getExtensionEnabledCameraSelector(base, ExtensionMode.NIGHT) else null
+        } catch (e: Exception) {
+            Log.w(TAG, "night extension check failed", e)
+            null
+        }
+    }
+
+    /** 夜景の拡張でメガネへの配信（ImageAnalysis）を一緒に束ねられない端末のための、捨てるだけのプレビュー（画面には出さない） */
+    private fun discardPreview(): Preview {
+        val p = Preview.Builder().setTargetRotation(rotation).build()
+        val executor = ContextCompat.getMainExecutor(this)
+        p.setSurfaceProvider(executor) { request ->
+            val size = request.resolution
+            val reader = ImageReader.newInstance(size.width, size.height, ImageFormat.PRIVATE, 3, HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE)
+            reader.setOnImageAvailableListener({ r ->
+                try {
+                    r.acquireLatestImage()?.close()
+                } catch (e: Exception) {
+                    // 閉じたあとに届いた
+                }
+            }, discardHandler())
+            request.provideSurface(reader.surface, executor) { reader.close() }
+        }
+        return p
+    }
+
+    private fun discardHandler(): Handler {
+        val t = dummyThread ?: HandlerThread("g2cam-discard").also {
+            it.start()
+            dummyThread = it
+        }
+        return Handler(t.looper)
+    }
+
+    /** 夜景の拡張が使えるか（向きごとに 1 回）を、束ねずに確かめておく（本体の画面と /status に出すため） */
+    private fun checkNightAvailability(provider: ProcessCameraProvider) {
+        val facing = facingValue
+        if (nightAvailable.containsKey(facing) || nightChecking) return
+        nightChecking = true
+        val f = ExtensionsManager.getInstanceAsync(this, provider)
+        f.addListener({
+            try {
+                val ext = f.get()
+                val base = if (facing == "user") CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
+                val ok = ext.isExtensionAvailable(base, ExtensionMode.NIGHT)
+                nightAvailable[facing] = ok
+                AppLog.i("夜景の拡張（${if (facing == "user") "フロント" else "リア"}）：${if (ok) "使えます" else "この端末にはありません（暗いときは露光を長めにするだけ）"}")
+                diagText = buildDiag()
+            } catch (e: Exception) {
+                Log.w(TAG, "night check failed", e)
+            } finally {
+                nightChecking = false
+            }
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    /**
+     * 撮影の前に、静止画の拡張を整える（recordLock の中で）。
+     * 暗いとき：夜景の拡張で束ね直す（使える端末なら。1 秒ほど）。束ねられなければ、露光を長めにしたまま通常で撮る。
+     *   暗いときは HDR・オートは使わない（露光を長めにする方を優先）。
+     * 明るいとき：高画質（オート・HDR）を使う設定なら、それで束ね直す（これまでどおり）
+     */
+    private fun prepareStillExtensionLocked() {
+        if (wantNightCapture()) {
+            if (nightBound) return
+            nightWanted = true
+            AppLog.i("暗いので、夜景の拡張で撮ります（数秒かかります。スマホを動かさないでください）")
+            try {
+                rebindAndWait(null)
+            } catch (e: Exception) {
+                Log.w(TAG, "rebind (night) failed", e)
+            }
+            if (nightBound) return
+            nightWanted = false
+            if (nightAvailable[facingValue] == true) {
+                nightBindFailed[facingValue] = bindNotes.ifEmpty { "理由不明" }.take(120)
+                AppLog.i("夜景の拡張で束ねられませんでした（${nightBindFailed[facingValue]}）。露光を長めにして撮ります")
+            } else {
+                AppLog.i("夜景の拡張はこの端末にありません。露光を長めにして撮ります")
+            }
+            return
+        }
+        val dark = Prefs.lowLightAuto(this) && lowLightActive
+        if (nightWanted || nightBound || (dark && extensionBound)) {
+            // 明るくなった・設定を切った：夜景の組み方を外す。暗いのに HDR・オートが残っている：外して露光を長めにする
+            nightWanted = false
+            if (dark) extensionWanted = false
+            try {
+                rebindAndWait(null)
+            } catch (e: Exception) {
+                Log.w(TAG, "rebind (night off) failed", e)
+            }
+        }
+        if (dark) return
+        if (Prefs.highQuality(this) && !extensionBound && extensionAvailable != false) {
+            if (Prefs.extensionOnDemand(this)) extensionWanted = true
+            try {
+                rebindAndWait(null)
+            } catch (e: Exception) {
+                Log.w(TAG, "rebind (extension on) failed", e)
+            }
+            if (!extensionBound) AppLog.i("静止画の拡張は使えません（この端末、またはこの組み方では）。通常の撮影にします")
+        }
+    }
+
+    /** 夜景の組み方でメガネへの配信を束ねられなかった（映像が止まっている）：撮ったらすぐ通常に戻す */
+    private fun releaseNightSoon() {
+        postWork {
+            synchronized(recordLock) {
+                if (session == null && armed == null && nightBound && !cameraIdle && running) {
+                    nightWanted = false
+                    AppLog.i("夜景で撮り終えたので、メガネへの映像が出る組み方に戻します")
+                    try {
+                        rebindAndWait(null)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "rebind (night release) failed", e)
+                    }
+                }
+            }
+        }
+    }
+
     /**
      * ユースケースを束ねる。spec が null なら「配信＋撮影」、あれば「配信＋録画（＋撮影）」。
      * 端末が同時に使えない組み合わせのときは、撮影 → 配信の順に外して試す。
@@ -954,7 +1299,9 @@ class CameraService : LifecycleService(), CameraController {
             try {
                 val provider = future.get()
                 // 静止画の拡張（HDR・オート）は、設定が「撮影の前後だけ」なら撮影の直前に求められたときだけ束ねる（待機中は通常の組み方）
-                val wantExt = spec == null && Prefs.highQuality(this) && (!Prefs.extensionOnDemand(this) || extensionWanted)
+                // 暗いときの撮影では夜景の拡張（nightWanted）。暗いときは HDR・オートは束ねない（露光を長めにする方を優先）
+                val dark = Prefs.lowLightAuto(this) && lowLightActive
+                val wantExt = spec == null && (nightWanted || (!dark && Prefs.highQuality(this) && (!Prefs.extensionOnDemand(this) || extensionWanted)))
                 if (wantExt) {
                     val extFuture = ExtensionsManager.getInstanceAsync(this, provider)
                     extFuture.addListener({
@@ -968,6 +1315,8 @@ class CameraService : LifecycleService(), CameraController {
                     }, ContextCompat.getMainExecutor(this))
                 } else {
                     finishBind(provider, null, spec, onDone)
+                    // 夜景の拡張が使えるかを先に確かめておく（本体の画面と /status に出す）
+                    if (spec == null && Prefs.lowLightNight(this)) checkNightAvailability(provider)
                 }
             } catch (e: Exception) {
                 lastError = "カメラを開始できません: ${e.message}"
@@ -997,6 +1346,12 @@ class CameraService : LifecycleService(), CameraController {
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .setTargetRotation(rotation)
+            // 露出の値（暗さの判定）を受け取る。録画の組み方では録画のユースケースにも付ける（配信を束ねられない端末向け）
+            try {
+                Camera2Interop.Extender(analysisBuilder).setSessionCaptureCallback(exposureCallback)
+            } catch (e: Exception) {
+                Log.w(TAG, "exposure callback (analysis) failed", e)
+            }
             if (ois) {
                 try {
                     Camera2Interop.Extender(analysisBuilder)
@@ -1031,6 +1386,11 @@ class CameraService : LifecycleService(), CameraController {
             var eisOn = false
             val video = if (spec != null) {
                 val vb = VideoCapture.Builder(spec.recorder).setTargetRotation(rotation)
+                try {
+                    Camera2Interop.Extender(vb).setSessionCaptureCallback(exposureCallback)
+                } catch (e: Exception) {
+                    Log.w(TAG, "exposure callback (video) failed", e)
+                }
                 if (eisMode != null) {
                     try {
                         Camera2Interop.Extender(vb)
@@ -1058,14 +1418,24 @@ class CameraService : LifecycleService(), CameraController {
                 attempts.add(Attempt(base, listOf(analysis, video), "配信+録画", "なし"))
                 attempts.add(Attempt(base, listOf(video), "録画のみ", "なし"))
             } else {
-                extensionSelector(ext, base)?.let { (sel, label) ->
-                    attempts.add(Attempt(sel, listOf(analysis, buildCapture(false, withInterop = false)), "配信+撮影", label))
+                val nightSel = if (nightWanted) nightSelector(ext, base) else null
+                if (nightSel != null) {
+                    // 暗いときの撮影：夜景の拡張。配信と一緒に束ねられない端末では、捨てるだけのプレビューと撮影だけにする（撮る間はメガネの映像が止まる）
+                    attempts.add(Attempt(nightSel, listOf(analysis, buildCapture(false, withInterop = false)), "配信+撮影", NIGHT_LABEL))
+                    attempts.add(Attempt(nightSel, listOf(discardPreview(), buildCapture(false, withInterop = false)), "撮影のみ（夜景の間はメガネの映像が止まる）", NIGHT_LABEL))
+                } else if (!nightWanted) {
+                    extensionSelector(ext, base)?.let { (sel, label) ->
+                        attempts.add(Attempt(sel, listOf(analysis, buildCapture(false, withInterop = false)), "配信+撮影", label))
+                    }
                 }
                 val cap = buildCapture(recording = false, withInterop = true, fpsRange = idleRange)
                 attempts.add(Attempt(base, listOf(analysis, cap), "配信+撮影", "なし"))
                 attempts.add(Attempt(base, listOf(analysis), "配信のみ", "なし"))
             }
-            if (ext != null) extensionAvailable = extensionSelector(ext, base) != null
+            if (ext != null) {
+                extensionAvailable = extensionSelector(ext, base) != null
+                nightAvailable[facingValue] = nightSelector(ext, base) != null
+            }
 
             var bound: Camera? = null
             var used: Attempt? = null
@@ -1096,11 +1466,21 @@ class CameraService : LifecycleService(), CameraController {
                 "・端末の対応モード=" + availableStabModes().joinToString(",")
             extensionLabel = used.extension
             extensionBound = used.extension != "なし"
+            nightBound = used.extension == NIGHT_LABEL
             imageAnalysis = used.cases.filterIsInstance<ImageAnalysis>().firstOrNull()
             imageCapture = used.cases.filterIsInstance<ImageCapture>().firstOrNull()
             videoCapture = if (withVideo) video else null
             if (imageAnalysis == null) frameLock.withLock { latestFrame = null }
             lastError = null
+            // 露出から明るさを出すときの絞り（結果に絞りが入っていない端末向け）
+            try {
+                Camera2CameraInfo.from(bound.cameraInfo).getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES)
+                    ?.firstOrNull()?.let { if (it > 0f) defaultAperture = it }
+            } catch (e: Exception) {
+                Log.w(TAG, "aperture read failed", e)
+            }
+            // 低照度の露光を、この組み方（写真か録画か・拡張の有無）に合わせて掛け直す
+            reconcileLowLight("束ね直し", force = true)
             // ズームは束ね直すと 1 に戻るので、直前の倍率を掛け直す
             if (zoomNow != 1f) {
                 try {
@@ -1239,6 +1619,10 @@ class CameraService : LifecycleService(), CameraController {
             facingValue = next
             zoomNow = 1f
             frameLock.withLock { latestFrame = null }
+            // 別のカメラになる：夜景の組み方は外し、明るさのならしをやり直す
+            nightWanted = false
+            synchronized(lowLightLock) { lowLightDetector.reset() }
+            lowLightEv = Double.NaN
             // 切り替えが済んでから返す（直後にズーム範囲を読むため）。録画の準備をしていたなら、新しいカメラで準備し直す
             val a = armed
             if (a != null) {
@@ -1277,48 +1661,58 @@ class CameraService : LifecycleService(), CameraController {
                         }
                     }
                 }
-                // 高画質（端末の拡張）を「撮影の前後だけ」にしているとき：拡張が使える端末なら、撮影の前に拡張つきで束ね直す（1 秒ほど）
-                if (Prefs.highQuality(this) && Prefs.extensionOnDemand(this) && !extensionBound && extensionAvailable != false && running) {
-                    extensionWanted = true
-                    try {
-                        rebindAndWait(null)
-                    } catch (e: Exception) {
-                        Log.w(TAG, "rebind (extension on) failed", e)
-                    }
-                    if (!extensionBound) AppLog.i("静止画の拡張は使えません（この端末、またはこの組み方では）。通常の撮影にします")
-                }
+                // 静止画の拡張を整える：暗ければ夜景（使える端末なら）、明るければ高画質（オート・HDR。撮影の前後だけ。1 秒ほど）
+                if (running) prepareStillExtensionLocked()
             }
         }
         val cap = imageCapture
             ?: throw IllegalStateException(if (session != null) "この端末では録画中に撮影できません" else "カメラが起動していません")
 
-        // いったんメモリに受けて、すぐ保存先（選んだフォルダ or 写真アプリ）へ書く。読み戻しはしない
-        val buffer = ByteArrayOutputStream(4 * 1024 * 1024)
-        val options = ImageCapture.OutputFileOptions.Builder(buffer).build()
-
-        val latch = CountDownLatch(1)
-        var failure: Throwable? = null
-        cap.takePicture(options, ioExecutor, object : ImageCapture.OnImageSavedCallback {
-            override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-                latch.countDown()
-            }
-
-            override fun onError(exception: ImageCaptureException) {
-                failure = exception
-                latch.countDown()
-            }
-        })
-        // 拡張（HDR・夜景）の撮影は数秒かかることがある
-        if (!latch.await(20, TimeUnit.SECONDS)) throw IllegalStateException("撮影がタイムアウトしました")
-        failure?.let { throw it }
-        val bytes = buffer.toByteArray()
-        val name = "G2_" + SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
-        val uri = Storage.saveImage(this, bytes, name)
-        if (uri == null) {
-            lastError = "写真を保存できません（保存先を確認してください）"
+        val mode = when {
+            nightBound -> "night"
+            extensionBound -> extensionLabel
+            appliedLowLight != null -> "lowlight"
+            else -> "normal"
         }
-        photosTaken++
-        bytes
+        val startedAt = SystemClock.elapsedRealtime()
+        // 夜景の組み方でメガネへの配信を束ねられなかった（映像が止まっている）：撮り終えたら（失敗しても）すぐ通常に戻す
+        val releaseNight = nightBound && imageAnalysis == null
+        try {
+            // いったんメモリに受けて、すぐ保存先（選んだフォルダ or 写真アプリ）へ書く。読み戻しはしない
+            val buffer = ByteArrayOutputStream(4 * 1024 * 1024)
+            val options = ImageCapture.OutputFileOptions.Builder(buffer).build()
+
+            val latch = CountDownLatch(1)
+            var failure: Throwable? = null
+            cap.takePicture(options, ioExecutor, object : ImageCapture.OnImageSavedCallback {
+                override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                    latch.countDown()
+                }
+
+                override fun onError(exception: ImageCaptureException) {
+                    failure = exception
+                    latch.countDown()
+                }
+            })
+            // 拡張（HDR・夜景）の撮影は数秒かかることがある
+            if (!latch.await(20, TimeUnit.SECONDS)) throw IllegalStateException("撮影がタイムアウトしました")
+            failure?.let { throw it }
+            val bytes = buffer.toByteArray()
+            val name = "G2_" + SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
+            val uri = Storage.saveImage(this, bytes, name)
+            if (uri == null) {
+                lastError = "写真を保存できません（保存先を確認してください）"
+            }
+            photosTaken++
+            lastCaptureMode = mode
+            if (mode == "night" || mode == "lowlight") {
+                val sec = (SystemClock.elapsedRealtime() - startedAt) / 100 / 10.0
+                AppLog.i("暗いところで撮りました（${if (mode == "night") "夜景の拡張" else "露光を長めに（fps ${appliedLowLight ?: "-"}）"}・$sec 秒）")
+            }
+            bytes
+        } finally {
+            if (releaseNight) releaseNightSoon()
+        }
     }
 
     // ── 録画：組み方 ──
@@ -1362,6 +1756,8 @@ class CameraService : LifecycleService(), CameraController {
      * 録画できる組み方が無ければ、配信＋撮影に戻して例外を投げる。
      */
     private fun bindForRecordingLocked(quality: String, still: Boolean): String {
+        // 録画の組み方に移る：撮影のための夜景の組み方は求めない（録画のあと元に戻すときに、夜景で束ね直さない）
+        nightWanted = false
         val want = qualityOf(quality)
         val wantShort = shortSideOf(want)
         val stabOn = Prefs.stabilization(this)

@@ -95,6 +95,28 @@ class LoadInfo(
     val extension: String,
 )
 
+/** 低照度の状態（/status 用。0.1.19） */
+class LowLightInfo(
+    /** コンパニオンの画面で「暗いときは自動で低照度撮影にする」をオンにしているか */
+    val enabled: Boolean,
+    /** いま暗いとみなしているか（カメラを開いているときだけ true） */
+    val active: Boolean,
+    /** 露出から見積もった明るさ（EV100。まだ分からなければ NaN） */
+    val ev: Double,
+    /** 夜景の拡張：available / unavailable / failed（束ねられなかった）/ unknown（まだ確かめていない） */
+    val night: String,
+    /** 暗いときの写真を夜景機能で撮る設定 */
+    val nightOn: Boolean,
+    /** 録画も暗いときは明るさを優先する設定 */
+    val video: Boolean,
+    /** いま掛けている AE の fps 範囲（例 7-30。掛けていなければ空） */
+    val range: String,
+    /** 直近の撮影の撮り方（night / lowlight / オート / HDR / normal。まだ撮っていなければ空） */
+    val lastCaptureMode: String,
+    /** 暗いとみなす段階（0 早め・1 ふつう・2 遅め） */
+    val level: Int,
+)
+
 /** 遡り録画の状態（/status 用） */
 class PreRollInfo(
     /** コンパニオンの画面でオンにしているか */
@@ -186,6 +208,8 @@ interface CameraController {
     val lastMergeNote: String?
     /** スマホの電池・温度・空き容量（直近の読み取り） */
     val monitor: DeviceMonitor.Snapshot?
+    /** 低照度の状態（0.1.19） */
+    val lowLight: LowLightInfo
 }
 
 /**
@@ -399,6 +423,17 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
             .put("servedFps", li.servedFps)
             .put("streamFpsCap", li.streamFpsCap)
             .put("extension", li.extension)
+        val ll = camera.lowLight
+        j.put("lowLightOn", ll.enabled)
+            .put("lowLight", ll.enabled && ll.active)
+            .put("lowLightEv", if (ll.ev.isNaN()) JSONObject.NULL else Math.round(ll.ev * 10) / 10.0)
+            .put("lowLightLux", if (ll.ev.isNaN()) JSONObject.NULL else Math.round(LowLight.luxOf(ll.ev)))
+            .put("lowLightNight", ll.night)
+            .put("lowLightNightOn", ll.nightOn)
+            .put("lowLightVideo", ll.video)
+            .put("lowLightRange", ll.range)
+            .put("lowLightLevel", ll.level)
+            .put("lastCaptureMode", ll.lastCaptureMode)
         val p = camera.preRollInfo
         j.put("preRoll", p.enabled)
             .put("preRollSec", p.seconds)

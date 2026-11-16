@@ -22,6 +22,10 @@ object Prefs {
     private const val KEY_HEAT_STOP_TEMP = "heatStopTemp"
     private const val KEY_HEAT_STOP_THERMAL = "heatStopThermal"
     private const val KEY_HEAT_HOT_THERMAL = "heatHotThermal"
+    private const val KEY_LOW_LIGHT = "lowLightAuto"
+    private const val KEY_LOW_LIGHT_NIGHT = "lowLightNight"
+    private const val KEY_LOW_LIGHT_VIDEO = "lowLightVideo"
+    private const val KEY_LOW_LIGHT_LEVEL = "lowLightLevel"
 
     private fun sp(context: Context) = context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
 
@@ -160,6 +164,36 @@ object Prefs {
 
     fun setHeatHotThermal(context: Context, value: Int) {
         sp(context).edit().putInt(KEY_HEAT_HOT_THERMAL, value).apply()
+    }
+
+    // ── 低照度（0.1.19。G2 カメラ・G2 録画の両方に効く） ──
+
+    /** 暗いときは自動で低照度撮影にする（露光を長めにする。写真・メガネの映像。録画は lowLightVideo） */
+    fun lowLightAuto(context: Context): Boolean = sp(context).getBoolean(KEY_LOW_LIGHT, true)
+
+    fun setLowLightAuto(context: Context, value: Boolean) {
+        sp(context).edit().putBoolean(KEY_LOW_LIGHT, value).apply()
+    }
+
+    /** 暗いときの写真は端末の夜景機能（カメラ拡張の Night）で撮る。非対応の端末では露光を長めにするだけ */
+    fun lowLightNight(context: Context): Boolean = sp(context).getBoolean(KEY_LOW_LIGHT_NIGHT, true)
+
+    fun setLowLightNight(context: Context, value: Boolean) {
+        sp(context).edit().putBoolean(KEY_LOW_LIGHT_NIGHT, value).apply()
+    }
+
+    /** 録画も暗いときは明るさを優先する（暗いほど fps が下がる。最低 7fps）。利用者の選択で既定オン */
+    fun lowLightVideo(context: Context): Boolean = sp(context).getBoolean(KEY_LOW_LIGHT_VIDEO, true)
+
+    fun setLowLightVideo(context: Context, value: Boolean) {
+        sp(context).edit().putBoolean(KEY_LOW_LIGHT_VIDEO, value).apply()
+    }
+
+    /** 暗いとみなす明るさの段階（0 = 早め、1 = ふつう、2 = 遅め。LowLight.LEVELS） */
+    fun lowLightLevel(context: Context): Int = sp(context).getInt(KEY_LOW_LIGHT_LEVEL, 1).coerceIn(0, LowLight.LEVELS.size - 1)
+
+    fun setLowLightLevel(context: Context, value: Int) {
+        sp(context).edit().putInt(KEY_LOW_LIGHT_LEVEL, value.coerceIn(0, LowLight.LEVELS.size - 1)).apply()
     }
 
     /** 実際に使う「録画を止める温度」。app は G2 アプリが頼んできた温度（0 で止めない）。0.0 なら温度では止めない */

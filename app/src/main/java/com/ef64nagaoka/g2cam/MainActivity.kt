@@ -384,6 +384,57 @@ class MainActivity : Activity() {
             setPadding(0, dp(2), 0, dp(8))
         })
 
+        // ── 暗いとき（低照度。0.1.19）。G2 カメラ・G2 録画の両方に効く ──
+        root.addView(TextView(this).apply {
+            text = "暗いとき（低照度。G2 カメラ・G2 録画の両方）"
+            textSize = 16f
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, dp(16), 0, dp(4))
+        })
+        root.addView(CheckBox(this).apply {
+            text = "暗いときは自動で低照度撮影にする（露光を長めにして明るく撮る。メガネの映像も明るくなる）"
+            isChecked = Prefs.lowLightAuto(this@MainActivity)
+            setOnCheckedChangeListener { _, checked ->
+                Prefs.setLowLightAuto(this@MainActivity, checked)
+                AppLog.i("設定を変えました：暗いときの低照度撮影 → ${if (checked) "オン" else "オフ"}")
+                notifyPrefsChanged()
+            }
+        })
+        root.addView(CheckBox(this).apply {
+            text = "暗いときの写真は夜景機能で撮る（端末が対応していれば。1 枚に数秒かかり、その間はメガネの映像が止まることがあります。スマホを動かさないでください）"
+            isChecked = Prefs.lowLightNight(this@MainActivity)
+            setOnCheckedChangeListener { _, checked ->
+                Prefs.setLowLightNight(this@MainActivity, checked)
+                AppLog.i("設定を変えました：暗いときの写真を夜景機能で → ${if (checked) "オン" else "オフ"}")
+                notifyPrefsChanged()
+            }
+        })
+        root.addView(CheckBox(this).apply {
+            text = "録画も暗いときは明るさを優先する（暗いほどフレームレートが下がり、最低 7fps 程度になります。切ると録画の fps は変えません）"
+            isChecked = Prefs.lowLightVideo(this@MainActivity)
+            setOnCheckedChangeListener { _, checked ->
+                Prefs.setLowLightVideo(this@MainActivity, checked)
+                AppLog.i("設定を変えました：録画も暗いときは明るさ優先 → ${if (checked) "オン" else "オフ"}")
+                notifyPrefsChanged()
+            }
+        })
+        val levelValues = LowLight.LEVELS.indices.toList().toIntArray()
+        addChoice(
+            root, "暗いとみなす明るさ",
+            LowLight.LEVELS.mapIndexed { i, lv -> "${lv.label}（約 ${lv.enterLux.toInt()} lux 以下で切り替え、約 ${lv.exitLux.toInt()} lux 以上で戻す）" + if (i == 1) "（既定）" else "" },
+            levelValues, Prefs.lowLightLevel(this),
+        ) {
+            Prefs.setLowLightLevel(this, it)
+            notifyPrefsChanged()
+        }
+        root.addView(TextView(this).apply {
+            text = "・明るさはカメラの露出から見積もった目安です。上の「低照度」の行に、いまの明るさ（lux）が出ます\n" +
+                "・暗い状態が 1.5 秒続いたら切り替え、明るい状態が 3 秒続いたら戻します\n" +
+                "・夜景機能が使えるかは、カメラを開いたときに確かめて「低照度」の行に出します"
+            textSize = 13f
+            setPadding(0, dp(2), 0, dp(8))
+        })
+
         root.addView(CheckBox(this).apply {
             text = "手ブレ補正を使う（光学式があれば静止画・配信に、動画は電子式も。非対応の端末では自動で外れます）。反映は次にカメラを開始したとき"
             isChecked = Prefs.stabilization(this@MainActivity)
@@ -583,6 +634,12 @@ class MainActivity : Activity() {
             "遡り録画：" + (
                 CameraService.preRollText()
                     ?: if (Prefs.preRoll(this)) "オン（${Prefs.preRollSeconds(this)} 秒）・G2 録画を開くと録りためを始めます" else "オフ"
+                ),
+        )
+        lines.add(
+            "低照度：" + (
+                CameraService.lowLightText()
+                    ?: if (Prefs.lowLightAuto(this)) "オン（カメラが動いていません）" else "オフ"
                 ),
         )
         lines.add("カメラ権限：" + if (camera) "OK" else "未許可")
