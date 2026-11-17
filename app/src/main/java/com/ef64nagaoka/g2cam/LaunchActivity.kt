@@ -16,10 +16,21 @@ import androidx.core.content.ContextCompat
  */
 class LaunchActivity : Activity() {
 
+    companion object {
+        /** 0.1.21：これが付いていたら、サービスを始めてすぐコンパニオン単体で録画を始める（値は始めた場所：タイル・通知） */
+        const val EXTRA_RECORD = "record"
+    }
+
     override fun onResume() {
         super.onResume()
+        val record = intent?.getStringExtra(EXTRA_RECORD)
         if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-            if (!CameraService.running) {
+            if (record != null) {
+                val i = Intent(this, CameraService::class.java)
+                    .setAction(CameraService.ACTION_START_RECORDING)
+                    .putExtra(CameraService.EXTRA_TRIGGER, record)
+                if (CameraService.running) startService(i) else ContextCompat.startForegroundService(this, i)
+            } else if (!CameraService.running) {
                 ContextCompat.startForegroundService(this, Intent(this, CameraService::class.java))
             }
         } else {

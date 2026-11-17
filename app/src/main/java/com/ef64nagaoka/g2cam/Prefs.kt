@@ -27,6 +27,7 @@ object Prefs {
     private const val KEY_LOW_LIGHT_VIDEO = "lowLightVideo"
     private const val KEY_LOW_LIGHT_VIDEO_MIN = "lowLightVideoMin"
     private const val KEY_LOW_LIGHT_LEVEL = "lowLightLevel"
+    private const val KEY_LAST_REC = "lastRecordOptions"
 
     private fun sp(context: Context) = context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
 
@@ -207,6 +208,46 @@ object Prefs {
 
     fun setLowLightLevel(context: Context, value: Int) {
         sp(context).edit().putInt(KEY_LOW_LIGHT_LEVEL, value.coerceIn(0, LowLight.LEVELS.size - 1)).apply()
+    }
+
+    /**
+     * コンパニオン単体で録るときの頼み方（0.1.21）：G2 アプリが最後に頼んだ画質・音声・静止画・fps・細かさ・止める温度。
+     * まだ G2 アプリで録っていなければフル HD・音声あり・30fps・標準・47 度
+     */
+    fun lastRecordOptions(context: Context): StartOptions {
+        val j = try {
+            org.json.JSONObject(sp(context).getString(KEY_LAST_REC, null) ?: "{}")
+        } catch (_: Exception) {
+            org.json.JSONObject()
+        }
+        return StartOptions(
+            audio = j.optBoolean("audio", true),
+            quality = j.optString("quality", "fhd"),
+            maxMs = 0L,
+            still = j.optBoolean("still", false),
+            continuous = false,
+            stopTempC = j.optDouble("stopTempC", 47.0).let { if (it.isNaN()) 47.0 else it },
+            minFreeBytes = 500L * 1024L * 1024L,
+            fps = VideoTuning.fpsOf(j.optInt("fps", 30)),
+            bitrate = VideoTuning.levelOf(j.optString("bitrate", VideoTuning.STD)),
+            origin = ORIGIN_COMPANION,
+        )
+    }
+
+    fun setLastRecordOptions(context: Context, o: StartOptions) {
+        val j = org.json.JSONObject()
+            .put("audio", o.audio).put("quality", o.quality).put("still", o.still)
+            .put("stopTempC", o.stopTempC).put("fps", o.fps).put("bitrate", o.bitrate)
+        sp(context).edit().putString(KEY_LAST_REC, j.toString()).apply()
+    }
+
+    /** 単体の録画で使う設定の説明（画面用） */
+    fun describeLastRecord(context: Context): String {
+        val o = lastRecordOptions(context)
+        val q = mapOf("uhd" to "4K", "fhd" to "フル HD", "hd" to "HD", "sd" to "SD")[o.quality] ?: o.quality
+        val known = sp(context).contains(KEY_LAST_REC)
+        return "$q・${o.fps}fps・細かさ ${VideoTuning.label(o.bitrate)}・音声${if (o.audio) "あり" else "なし"}" +
+            if (known) "（G2 アプリで最後に使った設定）" else "（まだ G2 アプリで録っていないので既定）"
     }
 
     /** 実際に使う「録画を止める温度」。app は G2 アプリが頼んできた温度（0 で止めない）。0.0 なら温度では止めない */

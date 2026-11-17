@@ -70,6 +70,18 @@
             </intent-filter>
         </receiver>
 
+        <!-- 0.1.21：クイック設定のタイル「G2 録画」（コンパニオン単体で録画を始める／止める） -->
+        <service
+            android:name=".RecordTileService"
+            android:exported="true"
+            android:icon="@android:drawable/ic_menu_camera"
+            android:label="G2 録画"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
         <service
             android:name=".CameraService"
             android:exported="false"

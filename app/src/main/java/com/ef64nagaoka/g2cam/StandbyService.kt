@@ -181,6 +181,17 @@ class StandbyService : Service() {
             .setContentText("G2 カメラを開くとカメラを自動で始めます")
             .setContentIntent(open)
             .setOngoing(true)
+            .addAction(
+                Notification.Action.Builder(
+                    android.R.drawable.ic_media_play, "録画開始",
+                    // 0.1.21：コンパニオン単体で録画を始める（カメラのサービスは前面の画面からしか始められないので、透明な画面を経由）
+                    PendingIntent.getActivity(
+                        this, 12,
+                        Intent(this, LaunchActivity::class.java).putExtra(LaunchActivity.EXTRA_RECORD, "通知").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+                    ),
+                ).build(),
+            )
             .addAction(Notification.Action.Builder(android.R.drawable.ic_delete, "待機をやめる", stop).build())
             .build()
     }

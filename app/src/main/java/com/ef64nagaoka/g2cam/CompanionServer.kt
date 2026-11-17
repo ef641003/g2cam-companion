@@ -46,7 +46,13 @@ class RecordingState(
     /** 目標のビットレート（bps。0 = 端末の標準のまま）と、頼まれた段階（std / high / max） */
     val bitrate: Int = 0,
     val bitrateLevel: String = VideoTuning.STD,
+    /** 誰が始めたか（g2 / companion。0.1.21） */
+    val origin: String = ORIGIN_G2,
 )
+
+/** 録画を始めたのが G2 アプリ（HTTP）か、コンパニオン単体（画面・通知・タイル）か（0.1.21） */
+const val ORIGIN_G2 = "g2"
+const val ORIGIN_COMPANION = "companion"
 
 /** 録画の結果 */
 data class RecordResult(
@@ -95,6 +101,8 @@ class StartOptions(
     val fps: Int = 30,
     /** 録画の細かさ（std / high / max。0.1.20） */
     val bitrate: String = VideoTuning.STD,
+    /** 誰が始めたか（g2 = G2 アプリ、companion = コンパニオン単体。0.1.21） */
+    val origin: String = ORIGIN_G2,
 )
 
 /** このアプリ自身の負荷と配信の様子（/status 用。adb が使えない端末で原因を見るため） */
@@ -471,6 +479,7 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
                 .put("recordPreRollMs", r.preRollMs)
                 .put("recordBytesPerSec", r.bytesPerSec)
                 .put("recordFps", r.fps)
+                .put("recordOrigin", r.origin)
                 .put("recordFpsWanted", r.fpsWanted)
                 .put("recordFpsNote", r.fpsNote)
                 .put("recordBitrate", r.bitrate)

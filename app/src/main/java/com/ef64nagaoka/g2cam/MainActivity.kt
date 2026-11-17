@@ -36,6 +36,8 @@ class MainActivity : Activity() {
 
     private lateinit var status: TextView
     private lateinit var toggle: Button
+    private lateinit var recordButton: Button
+    private lateinit var recordHint: TextView
     private lateinit var saveDir: TextView
     private lateinit var loadText: TextView
     private lateinit var logText: TextView
@@ -242,6 +244,19 @@ class MainActivity : Activity() {
         root.addView(toggle, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
             topMargin = dp(12)
         })
+
+        // ── 0.1.21：コンパニオン単体での録画 ──
+        recordButton = Button(this).apply {
+            setOnClickListener { onRecordButton() }
+        }
+        root.addView(recordButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            topMargin = dp(6)
+        })
+        recordHint = TextView(this).apply {
+            textSize = 13f
+            setPadding(0, dp(2), 0, dp(4))
+        }
+        root.addView(recordHint)
 
         saveDir = TextView(this).apply {
             setPadding(0, dp(12), 0, dp(4))
@@ -586,6 +601,21 @@ class MainActivity : Activity() {
         handler.postDelayed({ render() }, 300)
     }
 
+    /** 0.1.21：コンパニオン単体で録画を始める／止める（G2 アプリが始めた録画も止められる） */
+    private fun onRecordButton() {
+        if (CameraService.running && CameraService.recordingNow) {
+            startService(Intent(this, CameraService::class.java).setAction(CameraService.ACTION_STOP_RECORDING).putExtra(CameraService.EXTRA_TRIGGER, "画面"))
+        } else {
+            if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                requestRuntimePermissions()
+                return
+            }
+            val i = Intent(this, CameraService::class.java).setAction(CameraService.ACTION_START_RECORDING).putExtra(CameraService.EXTRA_TRIGGER, "画面")
+            if (CameraService.running) startService(i) else ContextCompat.startForegroundService(this, i)
+        }
+        handler.postDelayed({ render() }, 600)
+    }
+
     private fun onToggle() {
         if (CameraService.running) {
             startService(Intent(this, CameraService::class.java).setAction(CameraService.ACTION_STOP))
@@ -687,5 +717,17 @@ class MainActivity : Activity() {
         saveDir.text = "保存先：" + Storage.describe(this)
         status.text = lines.joinToString("\n")
         toggle.text = if (CameraService.running) "停止" else "カメラを開始"
+        val rec = CameraService.running && CameraService.recordingNow
+        recordButton.text = when {
+            rec && CameraService.recordingOrigin == ORIGIN_COMPANION -> "● 録画を止める"
+            rec -> "● 録画を止める（G2 アプリが始めた録画）"
+            else -> "コンパニオンで録画を始める"
+        }
+        recordHint.text = if (rec) {
+            "止めた動画は保存先に入ります。G2 録画・G2 カメラを開くと、録画を引き継いでメガネから止められます"
+        } else {
+            "設定：${Prefs.describeLastRecord(this)}。区切りなしの 1 本で録ります（高温・空き容量が少ないときは保存して止めます）。通知とクイック設定のタイル「G2 録画」からも始められます" +
+                (CameraService.standaloneError?.let { "\n⚠ $it" } ?: "")
+        }
     }
 }

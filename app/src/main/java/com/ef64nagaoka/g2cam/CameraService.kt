@@ -101,6 +101,11 @@ class CameraService : LifecycleService(), CameraController {
         const val PORT = 8787
         const val ACTION_STOP = "com.ef64nagaoka.g2cam.STOP"
         const val ACTION_STOP_RECORDING = "com.ef64nagaoka.g2cam.STOP_RECORDING"
+        /** コンパニオン単体で録画を始める（画面・通知・タイル。0.1.21）。extra「trigger」に始めた場所 */
+        const val ACTION_START_RECORDING = "com.ef64nagaoka.g2cam.START_RECORDING"
+        /** 録画中なら止め、録画していなければ単体で始める（タイル。0.1.21） */
+        const val ACTION_TOGGLE_RECORDING = "com.ef64nagaoka.g2cam.TOGGLE_RECORDING"
+        const val EXTRA_TRIGGER = "trigger"
         /** 本体の画面で遡り録画の設定を変えた */
         const val ACTION_PREROLL_CHANGED = "com.ef64nagaoka.g2cam.PREROLL_CHANGED"
         /** 本体の画面で配信の fps などの設定を変えた */
@@ -136,6 +141,11 @@ class CameraService : LifecycleService(), CameraController {
         @Volatile var photosTaken = 0
         /** 画面表示用：録画中なら「0:12」のような経過時間、録画していなければ null */
         @Volatile var recordingLabel: String? = null
+        /** 録画中か・誰が始めたか（タイルと画面のボタン用。0.1.21） */
+        @Volatile var recordingNow = false
+        @Volatile var recordingOrigin: String? = null
+        /** 単体の録画を始められなかったときの理由（画面用。始められたら null） */
+        @Volatile var standaloneError: String? = null
         /** 画面表示用：カメラ構成などの診断 */
         @Volatile var diagText: String? = null
         /** 画面表示用：電池・温度・空き容量（5 秒ごとに更新） */
@@ -386,6 +396,8 @@ class CameraService : LifecycleService(), CameraController {
         @Volatile var thumb: ByteArray? = null
         @Volatile var finishedBytes = 0L
         var timer: Runnable? = null
+        /** 録画中に G2 アプリから要求が届いたか（単体で始めた録画を G2 アプリが引き継いだか。0.1.21） */
+        @Volatile var clientSeen = false
         /** いまの 1 本を録り始めたときの、カメラから届いた枚数と時刻（実測の fps を出すため） */
         @Volatile var segFrames0 = 0L
         @Volatile var segStartAt = 0L
@@ -638,9 +650,21 @@ class CameraService : LifecycleService(), CameraController {
                 return START_NOT_STICKY
             }
             ACTION_STOP_RECORDING -> {
-                postWork { stopRecordingInternally("通知") }
+                if (!running) {
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
+                postWork { stopRecordingInternally(intent.getStringExtra(EXTRA_TRIGGER) ?: "通知") }
                 return START_NOT_STICKY
             }
+            ACTION_TOGGLE_RECORDING -> {
+                if (running && session != null) {
+                    postWork { stopRecordingInternally(intent.getStringExtra(EXTRA_TRIGGER) ?: "タイル") }
+                    return START_NOT_STICKY
+                }
+                standaloneTrigger = intent.getStringExtra(EXTRA_TRIGGER) ?: "タイル"
+            }
+            ACTION_START_RECORDING -> standaloneTrigger = intent.getStringExtra(EXTRA_TRIGGER) ?: "通知"
             ACTION_PREFS_CHANGED -> {
                 if (!running) {
                     stopSelf()
@@ -706,9 +730,17 @@ class CameraService : LifecycleService(), CameraController {
             // 前回つなぎ終えられなかった遡り録画があれば、ここで書き出し直す。録りためのかけらは片付ける
             postWork { recoverMerges() }
         }
+        // コンパニオン単体での録画開始（サービスを始めたところなら、カメラが開くのを待ってから）
+        standaloneTrigger?.let { t ->
+            standaloneTrigger = null
+            if (running) postWork { startStandalone(t) }
+        }
         // システムが勝手に再起動すると背景からのカメラ開始になり失敗するので、再起動はしない
         return START_NOT_STICKY
     }
+
+    /** onStartCommand の中だけで使う：単体で録画を始める場所（始めないなら null） */
+    private var standaloneTrigger: String? = null
 
     override fun onDestroy() {
         running = false
@@ -717,6 +749,11 @@ class CameraService : LifecycleService(), CameraController {
         diagText = null
         monitorLabel = null
         streamLabel = null
+        if (recordingNow) {
+            recordingNow = false
+            recordingOrigin = null
+        }
+        RecordTileService.refresh(this)
         AppLog.i("カメラのサービスを終了")
         mainHandler.removeCallbacks(idleWatchdog)
         mainHandler.removeCallbacks(healthTick)
@@ -757,7 +794,7 @@ class CameraService : LifecycleService(), CameraController {
                 armed = null
                 pendingArm = null
                 try {
-                    stopSessionLocked(null, rebind = false)?.let { pendingResult.set(it) }
+                    stopKeepingLocked(null, rebind = false)
                 } catch (e: Exception) {
                     Log.w(TAG, "stop recording (shutdown) failed", e)
                 }
@@ -819,6 +856,10 @@ class CameraService : LifecycleService(), CameraController {
 
     // ── フォアグラウンド化 ──
     private fun buildNotification(text: String?, recordingNow: Boolean): Notification {
+        val startRec = PendingIntent.getService(
+            this, 3, Intent(this, CameraService::class.java).setAction(ACTION_START_RECORDING).putExtra(EXTRA_TRIGGER, "通知"),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
@@ -840,6 +881,8 @@ class CameraService : LifecycleService(), CameraController {
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
             )
             builder.addAction(Notification.Action.Builder(android.R.drawable.ic_media_pause, "録画停止", stopRec).build())
+        } else if (!stopping) {
+            builder.addAction(Notification.Action.Builder(android.R.drawable.ic_media_play, "録画開始", startRec).build())
         }
         builder.addAction(Notification.Action.Builder(android.R.drawable.ic_delete, "停止", stop).build())
         return builder.build()
@@ -852,7 +895,7 @@ class CameraService : LifecycleService(), CameraController {
         if (!running) return
         val s = session
         val main = when {
-            s != null -> "録画中（${if (s.audio) "音声あり" else "無音"}${if (s.segment > 1) "・${s.segment} 本目" else ""}）"
+            s != null -> "録画中（${if (s.opts.origin == ORIGIN_COMPANION) "コンパニオンから・" else ""}${if (s.audio) "音声あり" else "無音"}${if (s.segment > 1) "・${s.segment} 本目" else ""}）"
             bufCur != null -> "遡り録画の録りため中（直前 ${Prefs.preRollSeconds(this)} 秒）"
             armed != null -> "録画の準備ができています"
             cameraIdle -> "待機中（カメラを閉じています。G2 アプリが映像を取りに来たら開きます）"
@@ -860,7 +903,12 @@ class CameraService : LifecycleService(), CameraController {
         }
         val merge = if (merging.isNotEmpty()) "動画を書き出し中（${merging.size} 本${if (stopping) "。済んだら止まります" else ""}）" else null
         val text = listOfNotNull(main, merge).joinToString("・").ifEmpty { null }
-        val key = "$text|${s != null}|$cameraIdle"
+        // タイルと画面のボタン用（0.1.21）
+        val wasRecording = recordingNow
+        recordingNow = s != null
+        recordingOrigin = s?.opts?.origin
+        if (wasRecording != recordingNow) RecordTileService.refresh(this)
+        val key = "$text|${s != null}|$cameraIdle|$stopping"
         if (key == lastNotificationText) return
         lastNotificationText = key
         try {
@@ -1798,6 +1846,7 @@ class CameraService : LifecycleService(), CameraController {
     override fun touch() {
         lastClientAt = SystemClock.elapsedRealtime()
         clientSeen = true
+        session?.clientSeen = true
     }
 
     override fun requestStop(): Boolean {
@@ -2398,7 +2447,7 @@ class CameraService : LifecycleService(), CameraController {
             val s = session
             if (s != null && s.current === rec) {
                 Log.w(TAG, "$why ${ev.cause?.message ?: ""}")
-                stopSessionLocked(why, rebind = true)?.let { pendingResult.set(it) }
+                stopKeepingLocked(why, rebind = true)
                 return
             }
             if (bufCur === rec) {
@@ -2656,6 +2705,7 @@ class CameraService : LifecycleService(), CameraController {
             fpsNote = s.tuning.fpsNote,
             bitrate = s.tuning.bitrate,
             bitrateLevel = s.tuning.bitrateLevel,
+            origin = s.opts.origin,
         )
     }
 
@@ -2676,6 +2726,8 @@ class CameraService : LifecycleService(), CameraController {
         val tapAt = SystemClock.elapsedRealtime()
         synchronized(recordLock) {
             session?.let { return snapshot(it) }
+            // G2 アプリの頼み方を覚えておく（コンパニオン単体で録るときに同じ設定で録る。0.1.21）
+            if (o.origin == ORIGIN_G2) Prefs.setLastRecordOptions(this, o)
             if (!cancelStop("録画")) throw IllegalStateException("コンパニオンを止めています（動画の書き出しが済むと止まります）")
             if (cameraIdle) ensureCameraLocked()
             if (camera == null) throw IllegalStateException("カメラが起動していません（止める途中から戻ったところなら、少し待ってからもう一度）")
@@ -2785,7 +2837,7 @@ class CameraService : LifecycleService(), CameraController {
             rollSegmentLocked(s, null)
         } else {
             Log.i(TAG, "録画を止めます（最長録画時間）")
-            stopSessionLocked(null, rebind = true)?.let { pendingResult.set(it) }
+            stopKeepingLocked(null, rebind = true)
         }
     }
 
@@ -2794,7 +2846,7 @@ class CameraService : LifecycleService(), CameraController {
         if (session !== s) return
         val vc = videoCapture
         if (vc == null) {
-            stopSessionLocked(note, rebind = true)?.let { pendingResult.set(it) }
+            stopKeepingLocked(note, rebind = true)
             return
         }
         val old = s.current
@@ -2958,13 +3010,55 @@ class CameraService : LifecycleService(), CameraController {
         list
     }
 
+    /**
+     * 録画を止め、結果を G2 アプリが取りに来るまで持っておく。
+     * ただしコンパニオン単体で始めて G2 アプリが一度も触れていない録画は、保存して終わり（G2 アプリの一覧には渡さない。0.1.21）
+     */
+    private fun stopKeepingLocked(note: String?, rebind: Boolean) {
+        val s = session
+        val r = stopSessionLocked(note, rebind) ?: return
+        if (s != null && s.opts.origin == ORIGIN_COMPANION && !s.clientSeen) {
+            AppLog.i("コンパニオンで録った動画を保存しました：${r.name}（${r.durationMs / 1000} 秒）")
+            return
+        }
+        pendingResult.set(r)
+    }
+
+    /**
+     * コンパニオン単体で録画を始める（0.1.21。画面のボタン・通知・クイック設定タイル）。
+     * 頼み方は G2 アプリが最後に使ったもの（区切りなし・高温と空き容量では止める）。カメラが開くまで少し待つ
+     */
+    private fun startStandalone(trigger: String) {
+        if (session != null) return
+        val o = Prefs.lastRecordOptions(this)
+        val deadline = SystemClock.elapsedRealtime() + 10_000L
+        var last: Exception? = null
+        while (running && !stopping && SystemClock.elapsedRealtime() < deadline) {
+            try {
+                startRecording(o)
+                standaloneError = null
+                AppLog.i("コンパニオンから録画を始めました（$trigger・${Prefs.describeLastRecord(this)}）")
+                return
+            } catch (e: Exception) {
+                last = e
+                // カメラがまだ開いていない（起動直後）：少し待ってやり直す
+                if (camera != null && !cameraIdle) break
+                Thread.sleep(400)
+            }
+        }
+        val why = last?.message ?: "カメラが動いていません"
+        standaloneError = "録画を始められませんでした：$why"
+        AppLog.w("コンパニオンからの録画を始められませんでした（$trigger）：$why")
+        refreshNotification()
+    }
+
     /** 自分の都合で止めたときは、結果を G2 カメラ側が取りに来るまで持っておく */
     private fun stopRecordingInternally(reason: String, note: String? = null) {
         try {
             synchronized(recordLock) {
                 if (session == null) return
                 Log.i(TAG, "録画を止めます（$reason）")
-                stopSessionLocked(note, rebind = true)?.let { pendingResult.set(it) }
+                stopKeepingLocked(note, rebind = true)
             }
         } catch (e: Exception) {
             Log.w(TAG, "stop recording ($reason) failed", e)
@@ -3028,7 +3122,7 @@ class CameraService : LifecycleService(), CameraController {
                             rollSegmentLocked(s, "空き容量の都合で早めに区切りました")
                         } else {
                             Log.i(TAG, "録画を止めます（空き容量）")
-                            stopSessionLocked("空き容量が少なくなったので録画を止めて保存しました", rebind = true)?.let { pendingResult.set(it) }
+                            stopKeepingLocked("空き容量が少なくなったので録画を止めて保存しました", rebind = true)
                             if (armed != null && Prefs.preRoll(this)) bufPaused = "space"
                         }
                     }
