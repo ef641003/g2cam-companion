@@ -2160,7 +2160,7 @@ class CameraService : LifecycleService(), CameraController {
             val caps = Recorder.getVideoCapabilities(info)
             val dr = androidx.camera.core.DynamicRange.HLG_10_BIT
             when {
-                !caps.supportedDynamicRanges.contains(dr) -> "この端末のカメラは HDR（10bit HLG）録画に対応していません"
+                !caps.supportedDynamicRanges.contains(dr) -> "この端末のカメラは HDR 録画に対応していません（10bit HLG）"
                 !caps.getSupportedQualities(dr).contains(want) -> "この画質では HDR で録れません"
                 else -> null
             }
