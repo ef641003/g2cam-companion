@@ -488,6 +488,17 @@ class MainActivity : Activity() {
             setOnCheckedChangeListener { _, checked -> Prefs.setStabilization(this@MainActivity, checked) }
         })
         root.addView(CheckBox(this).apply {
+            text = "録画を HDR（10bit HLG）で録る（逆光・夜景で白飛び・黒つぶれが減る。H.265 になるので、PC・SNS によっては色が薄く見える・再生できないことがある。発熱が増える。" +
+                "60fps と両立しないときは HDR を優先して 30fps、画質は下げない。使えないときは通常の録画）。反映は次の録画から"
+            isChecked = Prefs.hdrVideo(this@MainActivity)
+            setOnCheckedChangeListener { _, checked ->
+                Prefs.setHdrVideo(this@MainActivity, checked)
+                if (CameraService.running) {
+                    startService(Intent(this@MainActivity, CameraService::class.java).setAction(CameraService.ACTION_PREFS_CHANGED))
+                }
+            }
+        })
+        root.addView(CheckBox(this).apply {
             text = "静止画を高画質で撮る（端末のHDR・オート機能を使う。非対応の端末では通常撮影）。反映は次にカメラを開始したとき"
             isChecked = Prefs.highQuality(this@MainActivity)
             setOnCheckedChangeListener { _, checked -> Prefs.setHighQuality(this@MainActivity, checked) }
@@ -719,6 +730,7 @@ class MainActivity : Activity() {
         )
         // 0.1.20：レンズの倍率（光学の段）と、録画の組み方（実際の解像度・fps・細かさ）
         CameraService.lensText()?.let { lines.add("レンズ：$it") }
+        CameraService.hdrText()?.let { lines.add("HDR 録画：$it") }
         CameraService.recordPlanText()?.let { lines.add("録画の組み方：${if (it.length > 160) it.take(160) + "…" else it}") }
         lines.add("カメラ権限：" + if (camera) "OK" else "未許可")
         lines.add("録画の音声（マイク）：" + if (mic) "OK" else "未許可（無音で録画。許可はアプリ情報から）")

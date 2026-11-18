@@ -28,6 +28,7 @@ object Prefs {
     private const val KEY_LOW_LIGHT_VIDEO_MIN = "lowLightVideoMin"
     private const val KEY_LOW_LIGHT_LEVEL = "lowLightLevel"
     private const val KEY_LAST_REC = "lastRecordOptions"
+    private const val KEY_HDR_VIDEO = "hdrVideo"
 
     private fun sp(context: Context) = context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
 
@@ -208,6 +209,13 @@ object Prefs {
 
     fun setLowLightLevel(context: Context, value: Int) {
         sp(context).edit().putInt(KEY_LOW_LIGHT_LEVEL, value.coerceIn(0, LowLight.LEVELS.size - 1)).apply()
+    }
+
+    /** 録画を HDR（10bit HLG）で録る（0.1.23。既定オフ。G2 カメラ・G2 録画・単体の録画のすべてに効く） */
+    fun hdrVideo(context: Context): Boolean = sp(context).getBoolean(KEY_HDR_VIDEO, false)
+
+    fun setHdrVideo(context: Context, on: Boolean) {
+        sp(context).edit().putBoolean(KEY_HDR_VIDEO, on).apply()
     }
 
     /**

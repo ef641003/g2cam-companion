@@ -171,6 +171,9 @@ class CameraService : LifecycleService(), CameraController {
         /** 画面の「－ x2（デジタル 2 倍） ＋」の真ん中（0.1.22）。カメラが動いていなければ null */
         fun zoomText(): String? = instance?.zoomLabel()
 
+        /** 画面の「HDR 録画」の行（HDR がオンのときだけ。0.1.23） */
+        fun hdrText(): String? = instance?.let { if (Prefs.hdrVideo(it)) it.hdrSupportText() else null }
+
         /** いまの倍率で、もう上・下に段があるか（画面のボタンを押せるか） */
         fun canZoom(dir: Int): Boolean = instance?.let { it.nextZoomStep(dir) != null } ?: false
 
@@ -308,6 +311,7 @@ class CameraService : LifecycleService(), CameraController {
 
     private val exposureCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+            noteFocusState(result)
             countSensorFrame(result)
             onExposure(result)
         }
@@ -350,7 +354,17 @@ class CameraService : LifecycleService(), CameraController {
      * 録画の fps・細かさ（0.1.20）：頼まれたもの（fpsWanted・bitrateLevel）と、束ねた結果
      * （fps = 束ねた組み方の目標の fps、bitrate = 目標のビットレート。0 なら端末の標準のまま、fpsNote = 60fps が使えなかった理由）
      */
-    private class Tuning(val fpsWanted: Int, val bitrateLevel: String, val fps: Int, val bitrate: Int, val fpsNote: String) {
+    private class Tuning(
+        val fpsWanted: Int,
+        val bitrateLevel: String,
+        val fps: Int,
+        val bitrate: Int,
+        val fpsNote: String,
+        /** HDR（10bit HLG）を頼まれたか（コンパニオンの設定）・実際に HDR で束ねたか・使えなかった理由（0.1.23） */
+        val hdrWanted: Boolean = false,
+        val hdr: Boolean = false,
+        val hdrNote: String = "",
+    ) {
         companion object {
             val DEFAULT = Tuning(30, VideoTuning.STD, 30, 0, "")
         }
@@ -370,8 +384,9 @@ class CameraService : LifecycleService(), CameraController {
         val tuning: Tuning = Tuning.DEFAULT,
     ) {
         /** 頼まれた組み方（画質・静止画の有無・fps・細かさ・向き）が、この準備と同じか */
-        fun sameAs(quality: String, still: Boolean, fps: Int, bitrate: String, facing: String): Boolean =
-            this.quality == quality && this.still == still && tuning.fpsWanted == fps && tuning.bitrateLevel == bitrate && this.facing == facing
+        fun sameAs(quality: String, still: Boolean, fps: Int, bitrate: String, facing: String, hdr: Boolean): Boolean =
+            this.quality == quality && this.still == still && tuning.fpsWanted == fps && tuning.bitrateLevel == bitrate && this.facing == facing &&
+                tuning.hdrWanted == hdr
     }
 
     private class ArmRequest(
@@ -417,7 +432,7 @@ class CameraService : LifecycleService(), CameraController {
     }
 
     /** 束ね方：recorder があれば録画つき（静止画も束ねるか・電子式手ブレ補正のモード 0=なし・fps。60 のときだけ目標の fps を付ける） */
-    private class BindSpec(val recorder: Recorder, val still: Boolean, val eis: Int, val fps: Int = 30)
+    private class BindSpec(val recorder: Recorder, val still: Boolean, val eis: Int, val fps: Int = 30, val hdr: Boolean = false)
 
     // ── 録画の状態（recordLock の中で変える。読むだけなら外からでもよい） ──
     @Volatile private var session: Session? = null
@@ -439,6 +454,9 @@ class CameraService : LifecycleService(), CameraController {
     override val armedFps: Int get() = armed?.tuning?.fps ?: 0
     override val armedFpsWanted: Int get() = armed?.tuning?.fpsWanted ?: 0
     override val armedFpsNote: String get() = armed?.tuning?.fpsNote ?: ""
+    override val hdrWanted: Boolean get() = Prefs.hdrVideo(this)
+    override val armedHdr: Boolean get() = armed?.tuning?.hdr ?: false
+    override val armedHdrNote: String get() = armed?.tuning?.hdrNote ?: ""
     override val armedBitrate: String get() = armed?.tuning?.bitrateLevel ?: ""
     override val sensorFps: Double
         get() = if (camera == null || cameraIdle || SystemClock.elapsedRealtime() - lastSensorFrameAt > 1500L) 0.0 else sensorFpsNow
@@ -695,6 +713,20 @@ class CameraService : LifecycleService(), CameraController {
                 AppLog.i("設定を反映しました（配信の上限 ${Prefs.streamFps(this)}fps・低照度 ${if (Prefs.lowLightAuto(this)) "オン" else "オフ"}）")
                 // 低照度の設定（オン/オフ・録画・判定の段階）もここで反映する
                 postWork { reconcileLowLight("設定を変えた") }
+                // HDR を切り替えた（0.1.23）：録画の準備をしていれば、新しい設定で準備し直す
+                postWork {
+                    synchronized(recordLock) {
+                        val a = armed
+                        val req = lastArm
+                        if (a != null && req != null && session == null && a.tuning.hdrWanted != Prefs.hdrVideo(this)) {
+                            try {
+                                armLocked(req)
+                            } catch (e: Exception) {
+                                Log.w(TAG, "re-arm (hdr) failed", e)
+                            }
+                        }
+                    }
+                }
                 diagText = buildDiag()
                 return START_NOT_STICKY
             }
@@ -1215,6 +1247,45 @@ class CameraService : LifecycleService(), CameraController {
     // ── fps の実測とレンズ（0.1.20） ──
 
     /** カメラから 1 枚届いた（カメラのスレッド）。同じ結果は 1 回だけ数え、1 秒ごとに fps を締める */
+    // ── 録り始めのピント・露出待ち（0.1.23） ──
+    @Volatile private var afStateNow: Int? = null
+    @Volatile private var aeStateNow: Int? = null
+    private val focusResults = java.util.concurrent.atomic.AtomicLong(0)
+
+    private fun noteFocusState(r: TotalCaptureResult) {
+        try {
+            afStateNow = r.get(CaptureResult.CONTROL_AF_STATE)
+            aeStateNow = r.get(CaptureResult.CONTROL_AE_STATE)
+            focusResults.incrementAndGet()
+        } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * 録画を始める直前に、ピント（AF）と明るさ（AE）が合うのを待つ（長くても 1.5 秒。recordLock の中で、メイン以外から）。
+     * 録り始めの 1 秒ほどがボケたり暗かったりしないように。結果の説明（ログ用）を返す
+     */
+    private fun waitConverged(): String {
+        val start = SystemClock.elapsedRealtime()
+        val w = Converge.Watch(start)
+        val first = focusResults.get()
+        var seen = first
+        fun seenNone(@Suppress("UNUSED_PARAMETER") s0: Long, cur: Long) = cur == first
+        while (true) {
+            Thread.sleep(25)
+            val now = SystemClock.elapsedRealtime()
+            val n = focusResults.get()
+            if (n != seen) {
+                seen = n
+                w.update(afStateNow, aeStateNow, now)
+            }
+            if (w.ready(now)) return "合うのを待って ${now - start}ms"
+            if (w.timedOut(now)) return "合いきらないまま ${now - start}ms（AF ${w.lastAf}・AE ${w.lastAe}）"
+            // 撮影結果が届かない（届け方を付けられなかった端末）：待たない
+            if (now - start >= 400 && n == focusResults.get() && w.lastAf == null && w.lastAe == null && !w.ready(now) && seenNone(start, seen)) return "状態が届かないので待たない"
+        }
+    }
+
     private fun countSensorFrame(r: TotalCaptureResult) {
         val n = r.frameNumber
         if (n == lastFrameNumber) return
@@ -1679,6 +1750,8 @@ class CameraService : LifecycleService(), CameraController {
                 val vb = VideoCapture.Builder(spec.recorder).setTargetRotation(rotation)
                 // 60fps（0.1.20）：目標の fps を付ける。30fps のときは付けない（これまでと同じ組み方のまま）
                 if (spec.fps >= 50) vb.setTargetFrameRate(android.util.Range(spec.fps, spec.fps))
+                // HDR（10bit HLG。0.1.23）：H.265 で録られる
+                if (spec.hdr) vb.setDynamicRange(androidx.camera.core.DynamicRange.HLG_10_BIT)
                 try {
                     Camera2Interop.Extender(vb).setSessionCaptureCallback(exposureCallback)
                 } catch (e: Exception) {
@@ -2080,6 +2153,29 @@ class CameraService : LifecycleService(), CameraController {
 
     private fun sizeLabel(s: Size): String = "${maxOf(s.width, s.height)}x${minOf(s.width, s.height)}"
 
+    /** HDR（10bit HLG）で録れないなら理由（録れるなら null。0.1.23） */
+    private fun hdrUnsupportedReason(want: Quality): String? {
+        val info = camera?.cameraInfo ?: return "カメラが開いていません"
+        return try {
+            val caps = Recorder.getVideoCapabilities(info)
+            val dr = androidx.camera.core.DynamicRange.HLG_10_BIT
+            when {
+                !caps.supportedDynamicRanges.contains(dr) -> "この端末のカメラは HDR（10bit HLG）録画に対応していません"
+                !caps.getSupportedQualities(dr).contains(want) -> "この画質では HDR で録れません"
+                else -> null
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "hdr check failed", e)
+            "HDR に対応しているか確かめられません"
+        }
+    }
+
+    /** 画面・診断用：HDR に対応しているか（カメラが開いていなければ null） */
+    fun hdrSupportText(): String? {
+        if (camera == null) return null
+        return hdrUnsupportedReason(Quality.FHD)?.let { "使えません（$it）" } ?: "使えます（フル HD で確認）"
+    }
+
     private fun newRecorder(q: Quality, bitrate: Int? = null): Recorder {
         val b = Recorder.Builder()
             .setExecutor(recorderExecutor)
@@ -2149,7 +2245,7 @@ class CameraService : LifecycleService(), CameraController {
      * 手ブレ補正がオンのときは、電子式の補正つきの組み方だけを使う（利用者の選択：手ブレ補正を優先。端末に電子式の補正が無ければ補正なしで使う）。
      * 通った組み方は覚えて、次からは測らずに 1 回で束ねる。通らなかった理由は、このサービスが動いている間だけ覚える
      */
-    private fun try60Locked(quality: String, want: Quality, wantShort: Int, still: Boolean, stabOn: Boolean, level: String, tried: MutableList<String>): Pair<Int, String> {
+    private fun try60Locked(quality: String, want: Quality, wantShort: Int, still: Boolean, stabOn: Boolean, level: String, tried: MutableList<String>, hdr: Boolean = false): Pair<Int, String> {
         if (!camera60Supported()) {
             tried.add("60fps=端末のカメラが非対応")
             return Pair(-1, "この端末のカメラは 60fps に対応していません（30fps で録ります）")
@@ -2172,7 +2268,7 @@ class CameraService : LifecycleService(), CameraController {
         fpsProbing = true
         try {
             for (e in plans) {
-                rebindAndWait(BindSpec(newRecorder(want, bitrate), still, e, 60))
+                rebindAndWait(BindSpec(newRecorder(want, bitrate), still, e, 60, hdr))
                 val v = videoCapture
                 if (v == null) {
                     tried.add("60fps・補正$e=束ねられない")
@@ -2207,7 +2303,7 @@ class CameraService : LifecycleService(), CameraController {
             }
             // 補正つきでは 60fps が出なかった：補正なしなら出るかだけ確かめる（使わない。理由を正しく伝えるため）
             if (sawSlow && stabOn && !plans.contains(0)) {
-                rebindAndWait(BindSpec(newRecorder(want, bitrate), still, 0, 60))
+                rebindAndWait(BindSpec(newRecorder(want, bitrate), still, 0, 60, hdr))
                 val v = videoCapture
                 if (v != null) {
                     val size = videoSize(v)
@@ -2240,7 +2336,7 @@ class CameraService : LifecycleService(), CameraController {
      * 束ね直した結果を返す（頼まれた fps は 60 のまま、実際は 30、理由つき）
      */
     private fun downgrade60Locked(quality: String, still: Boolean, bitrate: String, why: String): Bound {
-        val key = Prefs.plan60Key(facingValue, quality, still, Prefs.stabilization(this))
+        val key = Prefs.plan60Key(facingValue, if (Prefs.hdrVideo(this) && hdrUnsupportedReason(qualityOf(quality)) == null) "$quality+hdr" else quality, still, Prefs.stabilization(this))
         plan60Failed[key] = "60fps では録画を始められませんでした（30fps で録ります）"
         Prefs.clearPlan60(this, key)
         AppLog.i("60fps の組み方で録画を始められないので、30fps に戻します（$why）")
@@ -2254,7 +2350,15 @@ class CameraService : LifecycleService(), CameraController {
      * 無ければ手ブレ補正のモードを強い順に試し、頼んだ画質が通ったもの（だめなら一番高かったもの）を覚える。
      * 録画できる組み方が無ければ、配信＋撮影に戻して例外を投げる。
      */
-    private fun bindForRecordingLocked(quality: String, still: Boolean, fps: Int = 30, bitrate: String = VideoTuning.STD): Bound {
+    private fun bindForRecordingLocked(
+        quality: String,
+        still: Boolean,
+        fps: Int = 30,
+        bitrate: String = VideoTuning.STD,
+        /** false なら HDR を試さない（HDR で束ねられなかったときのやり直し。理由は hdrNoteIn） */
+        allowHdr: Boolean = true,
+        hdrNoteIn: String = "",
+    ): Bound {
         // 録画の組み方に移る：撮影のための夜景の組み方は求めない（録画のあと元に戻すときに、夜景で束ね直さない）
         nightWanted = false
         val want = qualityOf(quality)
@@ -2263,30 +2367,44 @@ class CameraService : LifecycleService(), CameraController {
         val wantFps = VideoTuning.fpsOf(fps)
         val level = VideoTuning.levelOf(bitrate)
         val tried = ArrayList<String>()
-        fun tag(e: Int) = "${if (still) "撮影あり" else "撮影なし"}・補正$e"
+        // HDR（0.1.23）：コンパニオンの設定でオンなら、まず HDR で束ねる。fps より HDR を優先する（利用者の選択）が、画質は下げない
+        val hdrWanted = Prefs.hdrVideo(this)
+        var hdrNote = hdrNoteIn
+        var hdr = false
+        if (hdrWanted && allowHdr) {
+            val why = hdrUnsupportedReason(want)
+            if (why == null) hdr = true else hdrNote = "$why（通常の録画にします）"
+        }
+        // 組み方を覚える鍵：HDR は別に覚える
+        val planQuality = if (hdr) "$quality+hdr" else quality
+        fun tag(e: Int) = "${if (still) "撮影あり" else "撮影なし"}・補正$e${if (hdr) "・HDR" else ""}"
         var useFps = 30
         // 束ねた組み方の手ブレ補正のモード（束ねられていなければ -1）
         var useEis = -1
         var fpsNote = ""
         if (wantFps == 60) {
-            val r = try60Locked(quality, want, wantShort, still, stabOn, level, tried)
+            val r = try60Locked(planQuality, want, wantShort, still, stabOn, level, tried, hdr)
             if (r.first >= 0) {
                 useFps = 60
                 useEis = r.first
                 // 確かめている間は暗くても fps を下げていないので、ここで合わせ直す
                 reconcileLowLight("60fps の組み方", force = true)
             } else {
-                fpsNote = r.second
-                AppLog.i("60fps は使いません：$fpsNote")
+                fpsNote = if (hdr && !r.second.startsWith("この端末のカメラは")) {
+                    "HDR では 60fps が出ません（HDR を優先して 30fps で録ります。コンパニオンの HDR を切ると 60fps を試します）"
+                } else {
+                    r.second
+                }
+                AppLog.i("60fps は使いません：$fpsNote（${r.second}）")
             }
         }
         if (useFps != 60) {
             val bitrate30 = bitrateFor(want, level, 30)
             // 手ブレ補正がオフなら補正なしの 1 通りだけ
-            val cached = if (stabOn) Prefs.planEis(this, facingValue, quality, still) else 0
+            val cached = if (stabOn) Prefs.planEis(this, facingValue, planQuality, still) else 0
             var done = false
             if (cached != null) {
-                rebindAndWait(BindSpec(newRecorder(want, bitrate30), still, cached))
+                rebindAndWait(BindSpec(newRecorder(want, bitrate30), still, cached, 30, hdr))
                 val v = videoCapture
                 if (v != null) {
                     tried.add("${tag(cached)}=${videoSize(v)?.let { sizeLabel(it) } ?: "不明"}${if (stabOn) "（覚えていた組み方）" else ""}")
@@ -2310,7 +2428,7 @@ class CameraService : LifecycleService(), CameraController {
                 var bestShort = -1
                 var lastBound = -1
                 for (e in plans) {
-                    rebindAndWait(BindSpec(newRecorder(want, bitrate30), still, e))
+                    rebindAndWait(BindSpec(newRecorder(want, bitrate30), still, e, 30, hdr))
                     val v = videoCapture
                     if (v == null) {
                         tried.add("${tag(e)}=束ねられない")
@@ -2327,22 +2445,37 @@ class CameraService : LifecycleService(), CameraController {
                     if (short >= wantShort || size == null) break
                 }
                 if (bestEis >= 0) {
-                    if (bestEis != lastBound) rebindAndWait(BindSpec(newRecorder(want, bitrate30), still, bestEis))
-                    Prefs.setPlanEis(this, facingValue, quality, still, bestEis)
+                    if (bestEis != lastBound) rebindAndWait(BindSpec(newRecorder(want, bitrate30), still, bestEis, 30, hdr))
+                    Prefs.setPlanEis(this, facingValue, planQuality, still, bestEis)
                     useEis = bestEis
                 }
             }
         }
-        Log.i(TAG, "録画の組み方（頼んだ短辺 $wantShort・fps $wantFps・細かさ $level）: ${tried.joinToString(" / ")}")
+        Log.i(TAG, "録画の組み方（頼んだ短辺 $wantShort・fps $wantFps・細かさ $level・HDR $hdr）: ${tried.joinToString(" / ")}")
         var vc = videoCapture
         var size = vc?.let { videoSize(it) }
+        if (hdr) {
+            // HDR で束ねられたか・メガネの映像（と録画中の撮影）・画質を保てたか。だめなら通常の録画で束ね直す
+            val short = size?.let { minOf(it.width, it.height) } ?: 0
+            val why = when {
+                vc == null -> "HDR の組み方で束ねられません"
+                imageAnalysis == null -> "HDR ではメガネの映像を一緒に使えません"
+                still && imageCapture == null -> "HDR では録画中の撮影を一緒に使えません"
+                size != null && short < wantShort -> "HDR ではこの画質で録れません"
+                else -> null
+            }
+            if (why != null) {
+                AppLog.i("HDR は使いません：$why（${tried.joinToString(" / ")}）")
+                return bindForRecordingLocked(quality, still, fps, bitrate, allowHdr = false, hdrNoteIn = "$why（通常の録画にします）")
+            }
+        }
         // 目標のビットレートを出した画質（頼んだ画質より低い解像度で束ねられたら、その解像度に合わせ直す）
         var bitrateQuality = want
         if (vc != null && size != null && level != VideoTuning.STD && useEis >= 0) {
             val short = minOf(size.width, size.height)
             if (short < wantShort) {
                 bitrateQuality = qualityOfShort(short)
-                rebindAndWait(BindSpec(newRecorder(want, bitrateFor(bitrateQuality, level, useFps)), still, useEis, useFps))
+                rebindAndWait(BindSpec(newRecorder(want, bitrateFor(bitrateQuality, level, useFps)), still, useEis, useFps, hdr))
                 vc = videoCapture
                 size = vc?.let { videoSize(it) }
                 tried.add("細かさを実際の解像度（短辺 $short）に合わせて束ね直し")
@@ -2350,9 +2483,10 @@ class CameraService : LifecycleService(), CameraController {
         }
         val resolution = size?.let { sizeLabel(it) } ?: ""
         val targetBps = if (vc != null) bitrateFor(bitrateQuality, level, useFps) ?: 0 else 0
-        val tuning = Tuning(wantFps, level, useFps, targetBps, fpsNote)
+        val tuning = Tuning(wantFps, level, useFps, targetBps, fpsNote, hdrWanted, hdr, if (hdrWanted && !hdr) hdrNote else "")
+        if (hdrWanted && !hdr && hdrNote.isNotEmpty()) AppLog.i("HDR は使いません：$hdrNote")
         recordResLabel = if (vc != null) {
-            "${resolution.ifEmpty { "不明" }}・${useFps}fps・細かさ ${VideoTuning.label(level)}${if (targetBps > 0) "（目標 ${VideoTuning.mbpsLabel(targetBps.toLong())}）" else ""}" +
+            "${resolution.ifEmpty { "不明" }}・${useFps}fps${if (hdr) "・HDR" else ""}・細かさ ${VideoTuning.label(level)}${if (targetBps > 0) "（目標 ${VideoTuning.mbpsLabel(targetBps.toLong())}）" else ""}" +
                 "（頼んだ画質 $quality・fps $wantFps${if (fpsNote.isNotEmpty()) "：$fpsNote" else ""}。試した組み方: ${tried.joinToString(" / ")}）"
         } else {
             "録画できません（${tried.joinToString(" / ")}）"
@@ -2574,7 +2708,7 @@ class CameraService : LifecycleService(), CameraController {
 
     private fun armLocked(req: ArmRequest) {
         val a = armed
-        if (a != null && a.sameAs(req.quality, req.still, req.fps, req.bitrate, facingValue) && videoCapture != null) {
+        if (a != null && a.sameAs(req.quality, req.still, req.fps, req.bitrate, facingValue, Prefs.hdrVideo(this)) && videoCapture != null) {
             // 組み方は同じ。音声の有無が変わったなら録りためだけ録り直す
             if (a.audio != req.audio) stopBufferLocked()
             armed = ArmedConfig(req.quality, req.audio, req.still, facingValue, req.stopTempC, a.resolution, a.tuning)
@@ -2768,6 +2902,8 @@ class CameraService : LifecycleService(), CameraController {
             fps = s.tuning.fps,
             fpsWanted = s.tuning.fpsWanted,
             fpsNote = s.tuning.fpsNote,
+            hdr = s.tuning.hdr,
+            hdrNote = s.tuning.hdrNote,
             bitrate = s.tuning.bitrate,
             bitrateLevel = s.tuning.bitrateLevel,
             origin = s.opts.origin,
@@ -2801,7 +2937,7 @@ class CameraService : LifecycleService(), CameraController {
             var a = armed
             val oFps = VideoTuning.fpsOf(o.fps)
             val oBitrate = VideoTuning.levelOf(o.bitrate)
-            if (a != null && !(a.sameAs(o.quality, o.still, oFps, oBitrate, facingValue) && videoCapture != null)) {
+            if (a != null && !(a.sameAs(o.quality, o.still, oFps, oBitrate, facingValue, Prefs.hdrVideo(this)) && videoCapture != null)) {
                 // 準備と違う頼み方：静止画なし（G2 録画）なら頼まれた組み方で準備し直し、静止画あり（G2 カメラ）なら準備を解く
                 stopBufferLocked()
                 armed = null
@@ -2837,6 +2973,9 @@ class CameraService : LifecycleService(), CameraController {
                 var bound = if (armedNow != null) Bound(armedNow.resolution, armedNow.tuning) else bindForRecordingLocked(o.quality, o.still, oFps, oBitrate)
                 var vc = videoCapture ?: throw IllegalStateException("録画を開始できません（構成=$boundLabel）")
                 var rec = newDestinationRec(name, withAudio)
+                // 録り始めのピンぼけ・明るさのずれを防ぐ（0.1.23）
+                val settle = waitConverged()
+                AppLog.i("録り始めのピント・明るさ：$settle")
                 try {
                     startRecLocked(vc, rec)
                 } catch (e: Exception) {
@@ -2983,6 +3122,7 @@ class CameraService : LifecycleService(), CameraController {
                     thumbnail = s.thumb, error = listOfNotNull(note, saveError).joinToString("。").ifEmpty { null },
                     resolution = s.resolution, preRollMs = pre.plan.preRollMs, pending = true, segment = s.segment,
                     fps = s.tuning.fps, measuredFps = s.segFps, bitrate = s.tuning.bitrate, bitrateLevel = s.tuning.bitrateLevel, fpsNote = s.tuning.fpsNote,
+                    hdr = s.tuning.hdr, hdrNote = s.tuning.hdrNote,
                 )
             }
             parts.forEach { it.file.delete() }
@@ -2991,6 +3131,7 @@ class CameraService : LifecycleService(), CameraController {
                 error = listOfNotNull(note, "録画を保存できませんでした").joinToString("。"), resolution = s.resolution,
                 segment = s.segment,
                 fps = s.tuning.fps, measuredFps = s.segFps, bitrate = s.tuning.bitrate, bitrateLevel = s.tuning.bitrateLevel, fpsNote = s.tuning.fpsNote,
+                    hdr = s.tuning.hdr, hdrNote = s.tuning.hdrNote,
             )
         }
         val ev = rec.finalizeEvent
@@ -3006,6 +3147,7 @@ class CameraService : LifecycleService(), CameraController {
             thumbnail = s.thumb, error = listOfNotNull(note, error).joinToString("。").ifEmpty { null },
             resolution = s.resolution, preRollMs = 0L, pending = false, segment = s.segment,
             fps = s.tuning.fps, measuredFps = s.segFps, bitrate = s.tuning.bitrate, bitrateLevel = s.tuning.bitrateLevel, fpsNote = s.tuning.fpsNote,
+                    hdr = s.tuning.hdr, hdrNote = s.tuning.hdrNote,
         )
     }
 

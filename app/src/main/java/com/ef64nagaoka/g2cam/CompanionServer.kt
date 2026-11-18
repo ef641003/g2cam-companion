@@ -47,6 +47,9 @@ class RecordingState(
     val bitrate: Int = 0,
     val bitrateLevel: String = VideoTuning.STD,
     /** 誰が始めたか（g2 / companion。0.1.21） */
+    /** HDR で録っているか・使えなかった理由（0.1.23） */
+    val hdr: Boolean = false,
+    val hdrNote: String = "",
     val origin: String = ORIGIN_G2,
 )
 
@@ -81,6 +84,9 @@ data class RecordResult(
     val bitrateLevel: String = VideoTuning.STD,
     /** 60fps を頼まれたのに使えなかったときの理由 */
     val fpsNote: String = "",
+    /** HDR（10bit HLG）で録ったか・頼まれたのに使えなかったときの理由（0.1.23） */
+    val hdr: Boolean = false,
+    val hdrNote: String = "",
 )
 
 /** /record/start の頼み方 */
@@ -224,6 +230,10 @@ interface CameraController {
     val armedFps: Int
     val armedFpsWanted: Int
     val armedFpsNote: String
+    /** HDR（0.1.23） */
+    val hdrWanted: Boolean
+    val armedHdr: Boolean
+    val armedHdrNote: String
     val armedBitrate: String
     /** カメラから届いている fps（実測。撮影結果の数。分からなければ 0） */
     val sensorFps: Double
@@ -432,6 +442,8 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
             .put("bitrate", r.bitrate)
             .put("bitrateLevel", r.bitrateLevel)
             .put("fpsNote", r.fpsNote)
+            .put("hdr", r.hdr)
+            .put("hdrNote", r.hdrNote)
         r.thumbnail?.let { j.put("thumbnailBase64", Base64.encodeToString(it, Base64.NO_WRAP)) }
         return j
     }
@@ -460,6 +472,10 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
             .put("armedFps", camera.armedFps)
             .put("armedFpsWanted", camera.armedFpsWanted)
             .put("armedFpsNote", camera.armedFpsNote)
+            // HDR（0.1.23）：コンパニオンの設定でオンか・準備した組み方が HDR か・使えなかった理由
+            .put("hdrWanted", camera.hdrWanted)
+            .put("armedHdr", camera.armedHdr)
+            .put("armedHdrNote", camera.armedHdrNote)
             .put("armedBitrate", camera.armedBitrate)
             .put("sensorFps", Math.round(camera.sensorFps * 10) / 10.0)
             .put("armPaused", camera.armPausedReason ?: JSONObject.NULL)
@@ -486,6 +502,8 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
                 .put("recordOrigin", r.origin)
                 .put("recordFpsWanted", r.fpsWanted)
                 .put("recordFpsNote", r.fpsNote)
+                .put("recordHdr", r.hdr)
+                .put("recordHdrNote", r.hdrNote)
                 .put("recordBitrate", r.bitrate)
                 .put("recordBitrateLevel", r.bitrateLevel)
         }
