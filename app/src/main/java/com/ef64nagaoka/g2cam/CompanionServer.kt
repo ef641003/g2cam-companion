@@ -191,6 +191,8 @@ interface CameraController {
     fun capture(): ByteArray
 
     /** レンズ側のズームを設定する。端末が複数レンズなら倍率に応じて超広角・標準・望遠が自動で切り替わる。実際の倍率を返す */
+    /** コンパニオンの画面・通知で倍率を変えた回数（0.1.22） */
+    val zoomSeq: Int
     fun setZoom(zoom: Double): Float
 
     /** カメラを切り替える。切り替えが済むまで待つ */
@@ -444,6 +446,8 @@ class CompanionServer(private val camera: CameraController, port: Int) : NanoHTT
             .put("width", camera.frameWidth)
             .put("height", camera.frameHeight)
             .put("zoom", camera.zoom.toDouble())
+            // 0.1.22：コンパニオンの画面・通知で倍率を変えるたびに増える（G2 アプリはこれが増えたら倍率を合わせる）
+            .put("zoomSeq", camera.zoomSeq)
             .put("zoomMin", camera.zoomMin.toDouble())
             .put("zoomMax", camera.zoomMax.toDouble())
             .put("canRecord", true)

@@ -106,6 +106,9 @@ class CameraService : LifecycleService(), CameraController {
         /** 録画中なら止め、録画していなければ単体で始める（タイル。0.1.21） */
         const val ACTION_TOGGLE_RECORDING = "com.ef64nagaoka.g2cam.TOGGLE_RECORDING"
         const val EXTRA_TRIGGER = "trigger"
+        /** コンパニオンの画面・通知からズームを 1 段変える（0.1.22）。extra「dir」に +1 / -1 */
+        const val ACTION_ZOOM_STEP = "com.ef64nagaoka.g2cam.ZOOM_STEP"
+        const val EXTRA_DIR = "dir"
         /** 本体の画面で遡り録画の設定を変えた */
         const val ACTION_PREROLL_CHANGED = "com.ef64nagaoka.g2cam.PREROLL_CHANGED"
         /** 本体の画面で配信の fps などの設定を変えた */
@@ -165,6 +168,12 @@ class CameraService : LifecycleService(), CameraController {
         /** 画面表示用：レンズの倍率と、いまのズームが光学かデジタルか（サービスが動いていなければ null） */
         fun lensText(): String? = instance?.describeLens()
 
+        /** 画面の「－ x2（デジタル 2 倍） ＋」の真ん中（0.1.22）。カメラが動いていなければ null */
+        fun zoomText(): String? = instance?.zoomLabel()
+
+        /** いまの倍率で、もう上・下に段があるか（画面のボタンを押せるか） */
+        fun canZoom(dir: Int): Boolean = instance?.let { it.nextZoomStep(dir) != null } ?: false
+
         /** 画面表示用：録画の組み方（解像度・fps・細かさ。まだ束ねていなければ null） */
         fun recordPlanText(): String? = instance?.recordResLabel?.takeIf { it != "－" }
     }
@@ -185,6 +194,8 @@ class CameraService : LifecycleService(), CameraController {
     }
 
     @Volatile private var zoomNow = 1f
+    @Volatile private var zoomSeqValue = 0
+    override val zoomSeq: Int get() = zoomSeqValue
     override val zoom: Float get() = zoomNow
     override val zoomMin: Float get() = camera?.cameraInfo?.zoomState?.value?.minZoomRatio ?: 1f
     override val zoomMax: Float get() = camera?.cameraInfo?.zoomState?.value?.maxZoomRatio ?: 1f
@@ -665,6 +676,16 @@ class CameraService : LifecycleService(), CameraController {
                 standaloneTrigger = intent.getStringExtra(EXTRA_TRIGGER) ?: "タイル"
             }
             ACTION_START_RECORDING -> standaloneTrigger = intent.getStringExtra(EXTRA_TRIGGER) ?: "通知"
+            ACTION_ZOOM_STEP -> {
+                if (running) {
+                    val dir = intent.getIntExtra(EXTRA_DIR, 0)
+                    val from = intent.getStringExtra(EXTRA_TRIGGER) ?: "通知"
+                    postWork { zoomStep(dir, from) }
+                } else {
+                    stopSelf()
+                }
+                return START_NOT_STICKY
+            }
             ACTION_PREFS_CHANGED -> {
                 if (!running) {
                     stopSelf()
@@ -864,8 +885,10 @@ class CameraService : LifecycleService(), CameraController {
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        val stop = PendingIntent.getService(
-            this, 1, Intent(this, CameraService::class.java).setAction(ACTION_STOP),
+        // 0.1.22：通知のボタンは「ズーム－・ズーム＋・録画開始/停止」（通知のボタンは 3 つまで。コンパニオンを止めるのは画面から）
+        fun zoomIntent(code: Int, dir: Int) = PendingIntent.getService(
+            this, code,
+            Intent(this, CameraService::class.java).setAction(ACTION_ZOOM_STEP).putExtra(EXTRA_DIR, dir).putExtra(EXTRA_TRIGGER, "通知"),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val builder = Notification.Builder(this, CHANNEL_ID)
@@ -875,6 +898,10 @@ class CameraService : LifecycleService(), CameraController {
             .setContentIntent(open)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
+        if (camera != null && !cameraIdle) {
+            builder.addAction(Notification.Action.Builder(android.R.drawable.ic_menu_zoom, "ズーム－", zoomIntent(4, -1)).build())
+            builder.addAction(Notification.Action.Builder(android.R.drawable.ic_menu_zoom, "ズーム＋", zoomIntent(5, 1)).build())
+        }
         if (recordingNow) {
             val stopRec = PendingIntent.getService(
                 this, 2, Intent(this, CameraService::class.java).setAction(ACTION_STOP_RECORDING),
@@ -884,7 +911,6 @@ class CameraService : LifecycleService(), CameraController {
         } else if (!stopping) {
             builder.addAction(Notification.Action.Builder(android.R.drawable.ic_media_play, "録画開始", startRec).build())
         }
-        builder.addAction(Notification.Action.Builder(android.R.drawable.ic_delete, "停止", stop).build())
         return builder.build()
     }
 
@@ -902,7 +928,9 @@ class CameraService : LifecycleService(), CameraController {
             else -> null
         }
         val merge = if (merging.isNotEmpty()) "動画を書き出し中（${merging.size} 本${if (stopping) "。済んだら止まります" else ""}）" else null
-        val text = listOfNotNull(main, merge).joinToString("・").ifEmpty { null }
+        // 0.1.22：いまの倍率（通知のズームのボタンの手応え）
+        val zoomPart = if (camera != null && !cameraIdle) zoomLabel()?.let { "ズーム $it" } else null
+        val text = listOfNotNull(main, merge, zoomPart).joinToString("・").ifEmpty { null }
         // タイルと画面のボタン用（0.1.21）
         val wasRecording = recordingNow
         recordingNow = s != null
@@ -1872,6 +1900,43 @@ class CameraService : LifecycleService(), CameraController {
         if (target != zoomNow) zoomChangedAt = SystemClock.elapsedRealtime()
         zoomNow = target
         return target
+    }
+
+    /** いまの倍率から、その向きの次の段（G2 アプリと同じ段。端なら null。0.1.22） */
+    fun nextZoomStep(dir: Int): Double? {
+        val steps = LensInfo.zoomSteps(zoomMin.toDouble(), zoomMax.toDouble(), lensesNow())
+        return LensInfo.stepFrom(steps, zoomNow.toDouble(), dir)
+    }
+
+    /** コンパニオンの画面・通知から倍率を 1 段変える（0.1.22）。G2 アプリは zoomSeq が増えたのを見て合わせる */
+    private fun zoomStep(dir: Int, from: String) {
+        if (camera == null) {
+            AppLog.w("カメラが開いていないので倍率を変えられません（$from）")
+            return
+        }
+        val next = nextZoomStep(dir)
+        if (next == null) {
+            AppLog.i("これ以上${if (dir > 0) "拡大" else "広角に"}できません（x${LensInfo.fmt(zoomNow.toDouble())}）")
+            return
+        }
+        val z = setZoom(next)
+        zoomSeqValue += 1
+        AppLog.i("コンパニオン（$from）で倍率を x${LensInfo.fmt(z.toDouble())} にしました")
+        refreshNotification()
+        // レンズの切り替わりは少し遅れるので、光学／デジタルの表示を少しあとで直す
+        mainHandler.postDelayed({ refreshNotification() }, 1200)
+    }
+
+    /** 「x2（デジタル 2 倍）」「x3（光学）」「x1」 */
+    fun zoomLabel(): String? {
+        if (camera == null) return null
+        val st = zoomStateNow()
+        val z = "x${LensInfo.fmt(zoomNow.toDouble())}"
+        return when (st.optical) {
+            true -> "$z（光学）"
+            false -> "$z（デジタル ${LensInfo.fmt(st.digital ?: 1.0)} 倍）"
+            null -> z
+        }
     }
 
     override fun setFacing(facing: String) {

@@ -144,4 +144,39 @@ class LensInfoTest {
         assertEquals("10", LensInfo.fmt(10.0))
         assertEquals("3.72", LensInfo.fmt(3.72))
     }
+
+    // ── 0.1.22：コンパニオンの画面・通知からのズーム（G2 アプリと同じ段） ──
+
+    @Test
+    fun zoomStepsBasic() {
+        assertEquals(listOf(0.6, 1.0, 2.0, 3.0, 5.0, 10.0), LensInfo.zoomSteps(0.6, 10.0, emptyList()))
+        assertEquals(listOf(0.5, 1.0, 2.0, 3.0, 5.0), LensInfo.zoomSteps(0.5, 8.0, emptyList()))
+        assertEquals(listOf(1.0, 2.0, 3.0, 5.0), LensInfo.zoomSteps(1.0, 6.0, emptyList()))
+        assertEquals(listOf(1.0), LensInfo.zoomSteps(1.0, 1.0, emptyList()))
+    }
+
+    @Test
+    fun zoomStepsAddLensRatios() {
+        val lenses = listOf(LensInfo.Lens("2", 0.6, "超広角"), LensInfo.Lens("0", 1.0, "標準"), LensInfo.Lens("3", 3.5, "望遠"))
+        assertEquals(listOf(0.6, 1.0, 2.0, 3.0, 3.5, 5.0, 10.0), LensInfo.zoomSteps(0.6, 10.0, lenses))
+        // 3% 以内に段があれば足さない・範囲の外は足さない
+        val near = listOf(LensInfo.Lens("3", 2.95, "望遠"), LensInfo.Lens("4", 12.0, "望遠"))
+        assertEquals(listOf(1.0, 2.0, 3.0, 5.0, 10.0), LensInfo.zoomSteps(1.0, 10.0, near))
+    }
+
+    @Test
+    fun stepFromMovesOneStep() {
+        val steps = listOf(0.6, 1.0, 2.0, 3.0, 3.5, 5.0, 10.0)
+        assertEquals(2.0, LensInfo.stepFrom(steps, 1.0, 1)!!, 1e-9)
+        assertEquals(0.6, LensInfo.stepFrom(steps, 1.0, -1)!!, 1e-9)
+        assertEquals(3.5, LensInfo.stepFrom(steps, 3.0, 1)!!, 1e-9)
+        // 段と段の間（G2 アプリ側で別の倍率にしていた）：その向きで一番近い段
+        assertEquals(3.0, LensInfo.stepFrom(steps, 2.5, 1)!!, 1e-9)
+        assertEquals(2.0, LensInfo.stepFrom(steps, 2.5, -1)!!, 1e-9)
+        // 端
+        assertNull(LensInfo.stepFrom(steps, 10.0, 1))
+        assertNull(LensInfo.stepFrom(steps, 0.6, -1))
+        // 浮動小数の誤差（0.9999）でも同じ段とみなす
+        assertEquals(2.0, LensInfo.stepFrom(steps, 0.9999, 1)!!, 1e-9)
+    }
 }

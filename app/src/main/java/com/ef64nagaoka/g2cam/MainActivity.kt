@@ -38,6 +38,9 @@ class MainActivity : Activity() {
     private lateinit var toggle: Button
     private lateinit var recordButton: Button
     private lateinit var recordHint: TextView
+    private lateinit var zoomMinus: Button
+    private lateinit var zoomPlus: Button
+    private lateinit var zoomLabel: TextView
     private lateinit var saveDir: TextView
     private lateinit var loadText: TextView
     private lateinit var logText: TextView
@@ -257,6 +260,30 @@ class MainActivity : Activity() {
             setPadding(0, dp(2), 0, dp(4))
         }
         root.addView(recordHint)
+
+        // ── 0.1.22：カメラの倍率（G2 アプリと同じ段。開いている G2 アプリも合わせる） ──
+        val zoomRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+        }
+        zoomMinus = Button(this).apply {
+            text = "－"
+            setOnClickListener { onZoomButton(-1) }
+        }
+        zoomPlus = Button(this).apply {
+            text = "＋"
+            setOnClickListener { onZoomButton(1) }
+        }
+        zoomLabel = TextView(this).apply {
+            textSize = 15f
+            gravity = android.view.Gravity.CENTER
+        }
+        zoomRow.addView(zoomMinus, LinearLayout.LayoutParams(dp(64), ViewGroup.LayoutParams.WRAP_CONTENT))
+        zoomRow.addView(zoomLabel, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        zoomRow.addView(zoomPlus, LinearLayout.LayoutParams(dp(64), ViewGroup.LayoutParams.WRAP_CONTENT))
+        root.addView(zoomRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            topMargin = dp(4)
+        })
 
         saveDir = TextView(this).apply {
             setPadding(0, dp(12), 0, dp(4))
@@ -601,6 +628,19 @@ class MainActivity : Activity() {
         handler.postDelayed({ render() }, 300)
     }
 
+    /** 0.1.22：倍率を 1 段変える（通知の「ズーム－／＋」と同じ） */
+    private fun onZoomButton(dir: Int) {
+        if (!CameraService.running) return
+        startService(
+            Intent(this, CameraService::class.java)
+                .setAction(CameraService.ACTION_ZOOM_STEP)
+                .putExtra(CameraService.EXTRA_DIR, dir)
+                .putExtra(CameraService.EXTRA_TRIGGER, "画面"),
+        )
+        handler.postDelayed({ render() }, 300)
+        handler.postDelayed({ render() }, 1400)
+    }
+
     /** 0.1.21：コンパニオン単体で録画を始める／止める（G2 アプリが始めた録画も止められる） */
     private fun onRecordButton() {
         if (CameraService.running && CameraService.recordingNow) {
@@ -718,6 +758,10 @@ class MainActivity : Activity() {
         status.text = lines.joinToString("\n")
         toggle.text = if (CameraService.running) "停止" else "カメラを開始"
         val rec = CameraService.running && CameraService.recordingNow
+        val zt = if (CameraService.running) CameraService.zoomText() else null
+        zoomLabel.text = zt?.let { "ズーム $it" } ?: "ズーム（カメラが動いているときだけ）"
+        zoomMinus.isEnabled = zt != null && CameraService.canZoom(-1)
+        zoomPlus.isEnabled = zt != null && CameraService.canZoom(1)
         recordButton.text = when {
             rec && CameraService.recordingOrigin == ORIGIN_COMPANION -> "● 録画を止める"
             rec -> "● 録画を止める（G2 アプリが始めた録画）"

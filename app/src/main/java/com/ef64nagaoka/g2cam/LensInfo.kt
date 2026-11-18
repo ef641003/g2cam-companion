@@ -111,6 +111,36 @@ object LensInfo {
         return ZoomState(lens, (digital * 10).roundToInt() / 10.0, digital < OPTICAL_MAX_DIGITAL)
     }
 
+    /** G2 アプリと同じズームの段（0.5 / 1 / 2 / 3 / 5 / 10 のうち端末の範囲内） */
+    val BASE_STEPS = listOf(0.5, 1.0, 2.0, 3.0, 5.0, 10.0)
+
+    /**
+     * ズームの段（0.1.22。G2 アプリの zoomSteps と同じ決め方）：基本の段のうち範囲内、下端が 0.5 でなければ下端も、
+     * 1 倍は必ず、レンズの倍率（光学の段）は近い段（3% 以内）が無ければ足す
+     */
+    fun zoomSteps(zoomMin: Double, zoomMax: Double, lenses: List<Lens>): List<Double> {
+        if (!(zoomMax > zoomMin + 0.01)) return listOf(1.0)
+        val steps = BASE_STEPS.filter { it >= zoomMin - 0.001 && it <= zoomMax + 0.001 }.toMutableList()
+        if (zoomMin < 0.95 && steps.none { abs(it - zoomMin) < 0.02 }) steps.add((zoomMin * 100).roundToInt() / 100.0)
+        if (steps.none { abs(it - 1.0) < 0.001 }) steps.add(1.0)
+        for (l in lenses) {
+            if (l.ratio < zoomMin - 0.001 || l.ratio > zoomMax + 0.001) continue
+            if (steps.any { abs(it - l.ratio) <= l.ratio * 0.03 }) continue
+            steps.add((l.ratio * 100).roundToInt() / 100.0)
+        }
+        return steps.sorted()
+    }
+
+    /**
+     * いまの倍率から 1 段上（dir > 0）／下（dir < 0）の段。いまが段と段の間なら、その向きで一番近い段。
+     * 端まで来ていれば null
+     */
+    fun stepFrom(steps: List<Double>, zoom: Double, dir: Int): Double? {
+        if (steps.isEmpty() || dir == 0) return null
+        val eps = max(0.01, zoom * 0.02)
+        return if (dir > 0) steps.firstOrNull { it > zoom + eps } else steps.lastOrNull { it < zoom - eps }
+    }
+
     /** 倍率の表示（0.6 / 1 / 3.5） */
     fun fmt(ratio: Double): String =
         if (abs(ratio - ratio.roundToInt()) < 0.005) ratio.roundToInt().toString()
